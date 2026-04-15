@@ -29,7 +29,6 @@ import random
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -95,7 +94,7 @@ class Args:
     num_mini_batches: int = 64         # minibatch size = num_steps*num_envs / num_mini_batches
     num_epochs: int = 8
     num_eval: int = 200
-    total_time_steps: int = 50_000_000
+    total_time_steps: int = 100_000_000
 
     # --- REPPO LR + schedule ---
     actor_lr: float = 6e-4
@@ -134,9 +133,9 @@ class Args:
 
     # --- Networks (depth-scaling axis; names match crl-reppo) ---
     actor_network_width: int = 256
-    actor_depth: int = 4
+    actor_depth: int = 32
     critic_network_width: int = 256      # also controls G_encoder width
-    critic_depth: int = 4                # also controls G_encoder depth
+    critic_depth: int = 32                # also controls G_encoder depth
     actor_skip_connections: int = 0      # reserved; declared-but-unused in crl-reppo
     critic_skip_connections: int = 0     # reserved; declared-but-unused in crl-reppo
     use_relu: int = 0                    # 0 => swish, 1 => relu (matches crl-reppo)
@@ -2333,32 +2332,28 @@ def train(args: Args):
 def main():
     args = tyro.cli(Args)
 
-    her_tag = (
-        "c_a"
-        if (args.use_her_critic and args.use_her_actor)
-        else "c"
-        if args.use_her_critic
-        else ""
-    )
-    tdl_tag = "_tdL" if args.use_her_td_lambda else "_td0"
-    algo_tag = (
-        f"{her_tag}{tdl_tag}_k{args.her_k}" if her_tag else "naive"
-    )
-    run_name = (
-        f"reppo_{args.env_id}_{algo_tag}"
-        f"_nenvs:{args.num_envs}_steps:{args.num_steps}"
-        f"_adepth:{args.actor_depth}_cdepth:{args.critic_depth}"
-        f"_awidth:{args.actor_network_width}_cwidth:{args.critic_network_width}"
-        f"_seed:{args.seed}"
-    )
-    run_name_with_time = f"{run_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    name_parts = []
+    if args.use_her_critic:
+        name_parts.append("c")
+    if args.use_her_actor:
+        name_parts.append("a")
+    name_parts.append("tdL" if args.use_her_td_lambda else "td0")
+    name_parts.append(f"k{args.her_k}")
+    run_name = "_".join(name_parts)
+
+    group_parts = list(name_parts)
+    if args.stagger_envs:
+        group_parts.append("stag")
+    if args.sample_new_action_for_tdL:
+        group_parts.append("sample-new-action")
+    auto_group = "_".join(group_parts)
 
     if args.track:
-        wandb_group = None if args.wandb_group == "." else args.wandb_group
+        wandb_group = auto_group if args.wandb_group == "." else args.wandb_group
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            name=run_name_with_time,
+            name=run_name,
             group=wandb_group,
             mode=args.wandb_mode,
             dir=args.wandb_dir,
