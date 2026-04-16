@@ -21,21 +21,23 @@ export SSL_CERT_FILE=./cacert.pem
 #   env_idx  = TASK_ID / 20
 #   var_idx  = (TASK_ID % 20) / 5
 #   seed_idx = TASK_ID % 5
-# Submit the full sweep with:  sbatch slurm/train_reppo.sh
-# Override W&B env vars via:   sbatch --export=WANDB_PROJECT=foo,... slurm/train_reppo.sh
+# Submit the full sweep with (datetime is shared across array tasks):
+#   DATETIME=$(date +%Y%m%d_%H%M) sbatch --export=ALL,DATETIME slurm/train_reppo.sh
+# Override W&B env vars via:
+#   sbatch --export=ALL,WANDB_PROJECT=foo,... slurm/train_reppo.sh
 # =============================================================================
 
 ENVS=(ant_big_maze ant_u4_maze ant_u5_maze ant_hardest_maze \
-      arm_push_easy arm_push_hard arm_binpick_hard)
+      arm_push_hard arm_binpick_hard arm_push_easy)
 
 SEEDS=(0 1 2 3 4)
 
 # NAME:HER_CRITIC:HER_ACTOR:HER_TD_LAMBDA
 VARIATIONS=(
-	"crit_td0:true:false:false"
-	"crit_act_td0:true:true:false"
-	"crit_tdL:true:false:true"
 	"crit_act_tdL:true:true:true"
+	"crit_tdL:true:false:true"
+	"crit_act_td0:true:true:false"
+	"crit_td0:true:false:false"
 )
 
 NUM_SEEDS=${#SEEDS[@]}
@@ -60,11 +62,15 @@ STAGGER_DEBUG=true
 NORMALIZE_HINDSIGHT_LOSS=false
 SAMPLE_NEW_ACTION_FOR_TDL=true
 
+# Shared across all array tasks — set at submission time, see header comment
+# DATETIME="${DATETIME:-$(date +%Y%m%d_%H%M)}"
+
 # W&B group-name scheme mirrors reppo-gcrl/slurm/train_reppo_her_sweep.bash
 GROUP="baseline_k${HER_K}"
 [[ "$STAGGER_ENVS" == "true" ]]              && GROUP+="_stagger_envs"
 [[ "$NORMALIZE_HINDSIGHT_LOSS" == "true" ]]   && GROUP+="_normalize_hindsight_loss"
 [[ "$SAMPLE_NEW_ACTION_FOR_TDL" == "true" ]]  && GROUP+="_sample_new_action_for_tdL"
+GROUP+="_v2"
 
 # W&B logging (overridable via --export)
 WANDB_PROJECT="${WANDB_PROJECT:-crl-reppo}"

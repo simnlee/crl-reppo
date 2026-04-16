@@ -28,6 +28,7 @@ import pickle
 import random
 import sys
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -71,7 +72,7 @@ class Args:
     wandb_mode: str = "offline"        # 'offline'|'online'|'disabled'
     wandb_dir: str = "."
     wandb_group: str = "."             # '.' sentinel => None
-    checkpoint: bool = True
+    checkpoint: bool = False
     capture_vis: bool = True
     vis_length: int = 1000
     num_render: int = 10
@@ -186,6 +187,50 @@ class Normalizer:
         )
         return state.replace(mean=mean, var=var, count=count)
 
+    def _compute_stats_masked(
+        self, state_mean, state_var, state_count, obs: jax.Array, mask: jax.Array
+    ):
+        # obs: (N, *D), mask: (N,) with 0/1 float weights.
+        w = mask.astype(jnp.float32)
+        batch_size = jnp.sum(w)
+        safe_n = jnp.maximum(batch_size, 1.0)
+        w_exp = w.reshape((-1,) + (1,) * (obs.ndim - 1))
+        batch_mean = jnp.sum(w_exp * obs, axis=0) / safe_n
+        batch_var = jnp.sum(w_exp * jnp.square(obs - batch_mean), axis=0) / safe_n
+
+        delta = batch_mean - state_mean
+        count = state_count + batch_size
+        safe_count = jnp.maximum(count, 1.0)
+        new_mean = state_mean + delta * batch_size / safe_count
+        m_a = state_var * state_count
+        m_b = batch_var * batch_size
+        M2 = m_a + m_b + jnp.square(delta) * state_count * batch_size / safe_count
+        new_var = M2 / safe_count
+
+        nonempty = batch_size > 0
+        new_mean = jnp.where(nonempty, new_mean, state_mean)
+        new_var = jnp.where(nonempty, new_var, state_var)
+        new_count = jnp.where(nonempty, count, state_count).astype(state_count.dtype)
+        return new_mean, new_var, new_count
+
+    @functools.partial(jax.jit, static_argnums=0)
+    def update_masked(
+        self,
+        state: NormalizationState,
+        tree: struct.PyTreeNode,
+        mask: jax.Array,
+    ) -> NormalizationState:
+        tree = jax.tree_util.tree_map(lambda x, m: x.reshape(-1, *m.shape), tree, state.mean)
+        flat_mask = mask.reshape(-1)
+        stats = jax.tree_util.tree_map(
+            lambda m, v, c, x: self._compute_stats_masked(m, v, c, x, flat_mask),
+            state.mean, state.var, state.count, tree,
+        )
+        mean, var, count = jax.tree_util.tree_transpose(
+            jax.tree_util.tree_structure(tree), jax.tree_util.tree_structure(("*", "*", "*")), stats,
+        )
+        return state.replace(mean=mean, var=var, count=count)
+
     @functools.partial(jax.jit, static_argnums=0)
     def normalize(self, state: NormalizationState, tree: struct.PyTreeNode) -> struct.PyTreeNode:
         return jax.tree_util.tree_map(
@@ -240,20 +285,29 @@ class StaggeredResetWrapper(Wrapper):
     behaves identically to :class:`AutoResetWrapper`: any env whose new
     ``done=True`` is reset to the cached initial state on the same tick.
 
-    When all-True (flipped by :func:`stagger_env_state` after the random-
-    action warmup), envs that intrinsically terminate (``done=True`` with
-    ``truncation=0``) freeze instead of resetting:
+    When active, the wrapper emits a real terminal transition on the tick
+    of an intrinsic termination (``done=True`` with ``truncation=0``):
 
-    * ``pipeline_state`` and ``obs`` revert to their pre-step values.
-    * ``reward`` is zeroed; ``done`` and ``truncation`` are cleared.
+    * ``reward`` and ``done=1`` and ``truncation=0`` are preserved — the
+      transition is a bona fide MDP terminal step (``valid_mask=True``).
+    * The carry ``obs`` is reset to ``first_obs`` (via ``reset_mask``) so
+      the *next* tick's env.step starts from a clean initial state.
+    * ``is_waiting`` flips True so the next tick freezes cleanly.
+
+    On subsequent ticks while ``is_waiting=True`` the wrapper freezes:
+
+    * ``pipeline_state`` and ``obs`` revert to the pre-step carry.
+    * ``reward``, ``done``, and ``truncation`` are zeroed.
     * The EpisodeWrapper step counter is held frozen.
-    * ``is_waiting`` is set True and the transition emits ``valid_mask=False``.
+    * The transition emits ``valid_mask=False``.
 
     Every group's ``group_step`` counter advances in lockstep each tick.
     When it reaches the episode horizon ``H``, every env with that
-    ``group_idx`` resets together — a 'group reset gate'. Frozen envs
-    also reset at the gate, rejoining learning on the next tick. The gate
-    tick itself is emitted with ``valid_mask=False`` because the
+    ``group_idx`` resets together — a 'group reset gate'. The gate tick
+    emits ``truncation=1`` unconditionally (even when the env was waiting)
+    so HER's ``boundaries = max(done, truncated)`` detects the gate as an
+    episode boundary. The gate tick itself is emitted with
+    ``valid_mask=False`` because the
     ``(obs_before_reset, action, 0, first_obs, ...)`` transition is not a
     real MDP step.
     """
@@ -294,7 +348,8 @@ class StaggeredResetWrapper(Wrapper):
         state = self.env.step(state, action)
 
         intrinsic_done = (state.done > 0) & (state.info["truncation"] == 0)
-        freeze_now = active & (was_waiting | intrinsic_done)
+        freeze_now = active & was_waiting
+        enters_waiting = active & intrinsic_done & (~was_waiting)
         group_step_new = prev_group_step + 1
         gate_now = active & (group_step_new >= self._H)
 
@@ -323,15 +378,19 @@ class StaggeredResetWrapper(Wrapper):
         )
         steps_after_freeze = jnp.where(freeze_now, prev_steps, state.info["steps"])
         trunc_after_freeze = jnp.where(
-            freeze_now,
-            jnp.zeros_like(state.info["truncation"]),
-            state.info["truncation"],
+            gate_now,
+            jnp.ones_like(state.info["truncation"]),
+            jnp.where(
+                freeze_now,
+                jnp.zeros_like(state.info["truncation"]),
+                state.info["truncation"],
+            ),
         )
         raw_obs_after_freeze = _where(freeze_now, prev_raw_obs, state.obs)
 
-        # Reset path: staggered gate OR passthrough (done-triggered auto-reset).
+        # Reset path: staggered gate, terminal-this-tick, OR pre-stagger autoreset.
         passthrough_reset = (~active) & done_after_freeze.astype(jnp.bool_)
-        reset_mask = gate_now | passthrough_reset
+        reset_mask = gate_now | passthrough_reset | enters_waiting
 
         pipeline_final = jax.tree_util.tree_map(
             lambda cur, first: _where(reset_mask, first, cur),
@@ -344,13 +403,15 @@ class StaggeredResetWrapper(Wrapper):
             gate_now, jnp.zeros_like(group_step_new), group_step_new
         )
         is_waiting_final = jnp.where(
-            gate_now, jnp.zeros_like(was_waiting), freeze_now
+            gate_now,
+            jnp.zeros_like(was_waiting),
+            freeze_now | enters_waiting,
         )
         valid_mask_final = jnp.where(
             active, (~freeze_now) & (~gate_now), jnp.ones_like(active)
         )
         steps_final = jnp.where(
-            gate_now, jnp.zeros_like(steps_after_freeze), steps_after_freeze
+            reset_mask, jnp.zeros_like(steps_after_freeze), steps_after_freeze
         )
 
         state.info["steps"] = steps_final
@@ -1015,10 +1076,12 @@ def make_td_lambda_helpers(
             reward = transition.extras["soft_reward"]
             next_value = transition.extras["next_value"]
             truncated = transition.truncated
+            valid = transition.valid_mask
             lambda_sum = args.lmbda * returns + (1 - args.lmbda) * next_value
             lambda_return = reward + args.gamma * jnp.where(
                 truncated, next_value, (1.0 - done) * lambda_sum
             )
+            lambda_return = jnp.where(valid, lambda_return, returns)
             return lambda_return, lambda_return
 
         _, lambda_return = jax.lax.scan(
@@ -1170,8 +1233,12 @@ def make_td_lambda_helpers(
             is_boundary = (u == end)
             is_interior = (t_idx <= u) & (u < end)
 
-            rho_sum = rho_sum + jnp.sum(rho * is_interior)
-            rho_count = rho_count + jnp.sum(is_interior)
+            valid_u = batch_raw.valid_mask[u]
+            valid_b = valid_u[None, :]
+            valid_f = valid_b.astype(rho.dtype)
+
+            rho_sum = rho_sum + jnp.sum(rho * is_interior * valid_f)
+            rho_count = rho_count + jnp.sum(is_interior * valid_f)
 
             term_u = batch_raw.done[u]
             trunc_u = batch_raw.truncated[u]
@@ -1189,10 +1256,10 @@ def make_td_lambda_helpers(
             G_new = jnp.where(
                 is_boundary, G_bnd, jnp.where(is_interior, G_int, G)
             )
+            G_new = jnp.where(valid_b, G_new, G)
 
-            next_emb_acc = jnp.where(
-                (u == t_idx)[..., None], embed_u, next_emb_acc
-            )
+            write_emb = ((u == t_idx) & valid_b)[..., None]
+            next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
 
             return (G_new, rng, rho_sum, rho_count, next_emb_acc), None
 
@@ -1734,6 +1801,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
 class ReppoTrainingState:
     """Training state for REPPO-GCRL on crl-reppo's depth-scaling benchmarks."""
     env_steps: jnp.ndarray
+    valid_env_steps: jnp.ndarray
     iteration: jnp.ndarray
     actor_state: TrainState
     critic_state: TrainState
@@ -1937,6 +2005,7 @@ def train(args: Args):
 
         return ReppoTrainingState(
             env_steps=jnp.int32(0),
+            valid_env_steps=jnp.int32(0),
             iteration=jnp.int32(0),
             actor_state=actor_state,
             critic_state=critic_state,
@@ -1986,9 +2055,11 @@ def train(args: Args):
             length=args.num_steps,
         )
         _, last_env_state = rollout_state
+        valid_count = jnp.sum(transitions.valid_mask.astype(jnp.int32))
         train_state = train_state.replace(
             last_env_state=last_env_state,
             env_steps=train_state.env_steps + args.num_steps * args.num_envs,
+            valid_env_steps=train_state.valid_env_steps + valid_count,
         )
         return transitions, train_state
 
@@ -2014,7 +2085,9 @@ def train(args: Args):
         if args.use_her_td_lambda:
             batch_raw = batch
 
-        new_norm_state = normalizer.update(train_state.normalization_state, batch.obs)
+        new_norm_state = normalizer.update_masked(
+            train_state.normalization_state, batch.obs, batch.valid_mask
+        )
         norm_state = train_state.normalization_state
         if args.use_her_critic:
             obs_alt = normalizer.normalize(norm_state, obs_alt_raw)
@@ -2291,14 +2364,21 @@ def train(args: Args):
         training_walltime += epoch_time
 
         sps = (eval_interval * args.num_steps * args.num_envs) / epoch_time
+        env_step_count = int(train_state.env_steps)
+        valid_step_count = int(train_state.valid_env_steps)
         training_metrics = {
             "training/sps": sps,
             "training/walltime": training_walltime,
+            "training/env_steps": env_step_count,
+            "training/valid_env_steps": valid_step_count,
+            "training/valid_env_steps_frac": (
+                valid_step_count / max(1, env_step_count)
+            ),
             **{f"training/{k}": v for k, v in train_metrics.items()},
         }
 
         metrics = evaluator.run_evaluation(train_state, training_metrics)
-        current_step = int(train_state.env_steps)
+        current_step = valid_step_count
         log_metrics(current_step, eval_epoch, metrics)
 
         # Checkpoint cadence: first 5, last 5, every 10th (mirrors crl-reppo)
@@ -2308,16 +2388,17 @@ def train(args: Args):
             or eval_epoch % 10 == 0
         )
         if should_checkpoint:
-            checkpoint(train_state, tag=str(current_step))
+            checkpoint(train_state, tag=str(env_step_count))
 
         if trigger_sync is not None:
             trigger_sync()
 
     # Final checkpoint + optional capture_vis
-    final_step = int(train_state.env_steps)
-    checkpoint(train_state, tag=f"final_{final_step}")
+    final_env_step = int(train_state.env_steps)
+    final_valid_step = int(train_state.valid_env_steps)
+    checkpoint(train_state, tag=f"final_{final_env_step}")
     if args.capture_vis:
-        capture_vis_to_wandb(train_state, step=final_step)
+        capture_vis_to_wandb(train_state, step=final_valid_step)
         if trigger_sync is not None:
             trigger_sync()
 
@@ -2346,6 +2427,7 @@ def main():
         group_parts.append("stag")
     if args.sample_new_action_for_tdL:
         group_parts.append("sample-new-action")
+    group_parts.append(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     auto_group = "_".join(group_parts)
 
     if args.track:
