@@ -79,12 +79,12 @@ class Reacher(PipelineEnv):
         )
         tip_to_target = target_pos - tip_pos
         dist = jp.linalg.norm(tip_to_target)
-        reward_dist = -math.safe_norm(tip_to_target)
-        reward = reward_dist
+        success = jp.array(dist < 0.05, dtype=float)
+        reward = success
 
         state.metrics.update(
-            reward_dist=reward_dist,
-            success=jp.array(dist < 0.05, dtype=float),
+            reward_dist=-math.safe_norm(tip_to_target),
+            success=success,
             dist=dist
         )
         state.info.update(info)

@@ -89,13 +89,13 @@ class Args:
     goal_end_idx: int = 0
 
     # --- REPPO training sizes ---
-    num_envs: int = 1024
+    num_envs: int = 128
     num_eval_envs: int = 256
-    num_steps: int = 128
+    num_steps: int = 1000
     num_mini_batches: int = 64         # minibatch size = num_steps*num_envs / num_mini_batches
     num_epochs: int = 8
     num_eval: int = 200
-    total_time_steps: int = 100_000_000
+    total_time_steps: int = 50_000_000
 
     # --- REPPO LR + schedule ---
     actor_lr: float = 6e-4
@@ -1104,8 +1104,9 @@ def make_td_lambda_helpers(
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, batch.next_obs)
         next_action = next_pi.sample(seed=next_act_key)
+        boundary_mask = jnp.maximum(batch.truncated, batch.done)
         true_next_action = jnp.where(
-            batch.truncated[..., None],
+            boundary_mask[..., None],
             next_action,
             jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
         )
@@ -2386,7 +2387,7 @@ def train(args: Args):
         }
 
         metrics = evaluator.run_evaluation(train_state, training_metrics)
-        current_step = valid_step_count
+        current_step = valid_step_count if args.stagger_envs else env_step_count
         log_metrics(current_step, eval_epoch, metrics)
 
         # Checkpoint cadence: first 5, last 5, every 10th (mirrors crl-reppo)
@@ -2406,7 +2407,8 @@ def train(args: Args):
     final_valid_step = int(train_state.valid_env_steps)
     checkpoint(train_state, tag=f"final_{final_env_step}")
     if args.capture_vis:
-        capture_vis_to_wandb(train_state, step=final_valid_step)
+        vis_step = final_valid_step if args.stagger_envs else final_env_step
+        capture_vis_to_wandb(train_state, step=vis_step)
         if trigger_sync is not None:
             trigger_sync()
 

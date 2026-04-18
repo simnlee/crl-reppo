@@ -7,3 +7,5 @@ uv.lock
 ./envs/__pycache__/*
 *.venv/
 /runs/*
+checkpoints/
+slurm/output/

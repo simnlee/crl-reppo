@@ -344,7 +344,7 @@ class AntMazeGeneralization(PipelineEnv):
         dist = jp.linalg.norm(obs[:2] - obs[-2:])
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
-        reward = -dist + healthy_reward - ctrl_cost - contact_cost
+        reward = success
         state.metrics.update(
             reward_forward=forward_reward,
             reward_survive=healthy_reward,
