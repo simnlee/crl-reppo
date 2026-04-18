@@ -89,13 +89,13 @@ class Args:
     goal_end_idx: int = 0
 
     # --- REPPO training sizes ---
-    num_envs: int = 1024
+    num_envs: int = 128
     num_eval_envs: int = 256
-    num_steps: int = 128
+    num_steps: int = 1000
     num_mini_batches: int = 64         # minibatch size = num_steps*num_envs / num_mini_batches
     num_epochs: int = 8
     num_eval: int = 200
-    total_time_steps: int = 100_000_000
+    total_time_steps: int = 50_000_000
 
     # --- REPPO LR + schedule ---
     actor_lr: float = 6e-4
@@ -594,7 +594,6 @@ class SA_encoder(nn.Module):
         x = activation(x)
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -626,7 +625,6 @@ class G_encoder(nn.Module):
         x = activation(x)
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
-        x = nn.Dense(64, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         return x
 
 
@@ -726,7 +724,7 @@ class Critic(nn.Module):
         )(goal)
 
         fusion = jnp.concatenate([sa, g], axis=-1)
-        fusion_dim = 64 + 64
+        fusion_dim = 2 * self.network_width
 
         normalize = lambda y: nn.LayerNorm()(y)
         activation = nn.relu if self.use_relu else nn.swish
@@ -1046,7 +1044,8 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
 # Deltas from source:
 #   * nnx.merge(...)+actor_model(...) -> actor.apply(params, obs) + action_dist(...)
 #   * actor_model.temperature()       -> jnp.exp(params['params']['log_temperature'])
-#   * fusion_dim is now a hard 128 = 64+64 (SA + G encoder Dense(64) heads).
+#   * fusion_dim = 2 * critic_network_width (512 by default); encoders return
+#     their residual-tower width directly, no post-residual Dense(64).
 # =============================================================================
 
 
@@ -1058,7 +1057,7 @@ def make_td_lambda_helpers(
     goal_indices,
     goal_reach_thresh: float,
     replace_goal_in_obs,
-    fusion_dim: int = 128,
+    fusion_dim: int = 512,
 ):
     """Factory returning (nstep_lambda, compute_extras, compute_extras_alt,
     compute_alt_td_lambda_targets_k)."""
@@ -1081,7 +1080,11 @@ def make_td_lambda_helpers(
             lambda_return = reward + args.gamma * jnp.where(
                 truncated, next_value, (1.0 - done) * lambda_sum
             )
-            lambda_return = jnp.where(valid, lambda_return, returns)
+            # Skip pure freeze ticks; keep gate ticks so their truncation
+            # bootstrap propagates to earlier ticks of the old episode.
+            is_boundary = (truncated > 0) | (done > 0)
+            skip = (~valid.astype(jnp.bool_)) & (~is_boundary)
+            lambda_return = jnp.where(skip, returns, lambda_return)
             return lambda_return, lambda_return
 
         _, lambda_return = jax.lax.scan(
@@ -1101,8 +1104,9 @@ def make_td_lambda_helpers(
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, batch.next_obs)
         next_action = next_pi.sample(seed=next_act_key)
+        boundary_mask = jnp.maximum(batch.truncated, batch.done)
         true_next_action = jnp.where(
-            batch.truncated[..., None],
+            boundary_mask[..., None],
             next_action,
             jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
         )
@@ -1253,10 +1257,15 @@ def make_td_lambda_helpers(
                 * ((1.0 - args.lmbda * rho) * V_u + args.lmbda * rho * G),
             )
 
+            # Allow the scan to write at episode-boundary ticks (gate ticks
+            # carry truncated=1 with valid_mask=0) so G_bnd still flows
+            # backward into the interior's λρ·G term at earlier ticks.
+            boundary_u = (term_u[None, :] > 0) | (trunc_u[None, :] > 0)
+            write_allowed = valid_b | boundary_u
             G_new = jnp.where(
                 is_boundary, G_bnd, jnp.where(is_interior, G_int, G)
             )
-            G_new = jnp.where(valid_b, G_new, G)
+            G_new = jnp.where(write_allowed, G_new, G)
 
             write_emb = ((u == t_idx) & valid_b)[..., None]
             next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
@@ -1954,7 +1963,7 @@ def train(args: Args):
         goal_indices,
         goal_reach_thresh,
         replace_goal_in_obs,
-        fusion_dim=128,
+        fusion_dim=2 * args.critic_network_width,
     )
     (
         select_active_envs,
@@ -2378,7 +2387,7 @@ def train(args: Args):
         }
 
         metrics = evaluator.run_evaluation(train_state, training_metrics)
-        current_step = valid_step_count
+        current_step = valid_step_count if args.stagger_envs else env_step_count
         log_metrics(current_step, eval_epoch, metrics)
 
         # Checkpoint cadence: first 5, last 5, every 10th (mirrors crl-reppo)
@@ -2398,7 +2407,8 @@ def train(args: Args):
     final_valid_step = int(train_state.valid_env_steps)
     checkpoint(train_state, tag=f"final_{final_env_step}")
     if args.capture_vis:
-        capture_vis_to_wandb(train_state, step=final_valid_step)
+        vis_step = final_valid_step if args.stagger_envs else final_env_step
+        capture_vis_to_wandb(train_state, step=vis_step)
         if trigger_sync is not None:
             trigger_sync()
 
@@ -2420,6 +2430,7 @@ def main():
         name_parts.append("a")
     name_parts.append("tdL" if args.use_her_td_lambda else "td0")
     name_parts.append(f"k{args.her_k}")
+    name_parts.append(f"d{args.actor_depth}")
     run_name = "_".join(name_parts)
 
     group_parts = list(name_parts)

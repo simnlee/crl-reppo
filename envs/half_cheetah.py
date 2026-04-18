@@ -100,7 +100,7 @@ class Halfcheetah(PipelineEnv):
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
 
-        reward = ctrl_cost - dist
+        reward = success
 
         state.metrics.update(
             x_position=pipeline_state.x.pos[0, 0],

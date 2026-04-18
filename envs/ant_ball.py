@@ -148,11 +148,10 @@ class AntBall(PipelineEnv):
         # Distance between goal and object
         dist = jp.linalg.norm(obs[-2:] - obs[-4:-2])
 
-        reward = -dist + healthy_reward - ctrl_cost - contact_cost
-        done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
-        
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
+        reward = success
+        done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
         state.metrics.update(
             reward_survive=healthy_reward,
