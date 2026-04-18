@@ -31,8 +31,8 @@ uv run train.py \
 	--wandb-mode "${WANDB_MODE}" \
 	--wandb-group "${WANDB_GROUP}" \
 	--wandb-dir "${WANDB_DIR}" \
-	--num_epochs 1 \
-	--total_env_steps 5000000 \
+	--num_epochs 100 \
+	--total_env_steps 100000000 \
 	--critic_depth 16 \
 	--actor_depth 16 \
 	--actor_skip_connections 4 \
