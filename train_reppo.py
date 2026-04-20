@@ -1,18 +1,4 @@
-"""REPPO-GCRL ported into crl-reppo for depth-scaling benchmarks.
-
-This is a single-file monolithic training script mirroring the section order of
-`/home/simlee/reppo/reppo-gcrl/src/reppo_jaxgcrl.py`, but with:
-
-- crl-reppo's Actor/SA_encoder/G_encoder residual architecture (depth-scaling axis)
-  instead of REPPO's [256, 256] MLP.
-- `log_std` intentionally UNCLAMPED (drops crl-reppo's SAC-convention
-  tanh-rescale clamp — that is behavioral, not structural, and fights REPPO's
-  KL-Lagrangian + adaptive entropy temperature).
-- flax.linen (0.7.4) throughout instead of flax.nnx (pinned by crl-reppo deps).
-- distrax for tanh-Normal action distributions.
-- crl-reppo's make_env registry and CrlEvaluator for eval parity with
-  Wang et al., "1000 Layer Networks for Self-Supervised RL", NeurIPS 2025.
-
+"""
 Section order (top-to-bottom):
   imports -> Args -> Normalizer -> AutoResetWrapper/wrap_for_training -> hl_gauss
   -> prefix_dict/log_metrics -> networks (residual_block, SA_encoder, G_encoder,
@@ -63,7 +49,7 @@ from evaluator import CrlEvaluator
 
 @dataclass
 class Args:
-    # --- crl-reppo ergonomics ---
+    # --- Run / logging ergonomics ---
     exp_name: str = "reppo"
     seed: int = 42
     track: bool = True
@@ -132,18 +118,18 @@ class Args:
     stagger_warmup_policy: str = "random"
     stagger_debug: bool = False
 
-    # --- Networks (depth-scaling axis; names match crl-reppo) ---
+    # --- Networks (depth-scaling axis follows scaling-crl) ---
     actor_network_width: int = 256
     actor_depth: int = 32
     critic_network_width: int = 256      # also controls G_encoder width
     critic_depth: int = 32                # also controls G_encoder depth
-    actor_skip_connections: int = 0      # reserved; declared-but-unused in crl-reppo
-    critic_skip_connections: int = 0     # reserved; declared-but-unused in crl-reppo
-    use_relu: int = 0                    # 0 => swish, 1 => relu (matches crl-reppo)
+    actor_skip_connections: int = 0      # reserved
+    critic_skip_connections: int = 0     # reserved
+    use_relu: int = 0                    # 0 => swish, 1 => relu (matches scaling-crl)
 
 
 # =============================================================================
-# Normalizer (verbatim from reppo-gcrl/src/normalization.py)
+# Normalizer
 # =============================================================================
 
 
@@ -154,6 +140,14 @@ class NormalizationState(struct.PyTreeNode):
 
 
 class Normalizer:
+    """Welford online estimator of per-feature mean and variance.
+
+    ``update`` folds a fresh batch into the running moments; ``update_masked``
+    does the same but only counts entries where ``mask=True`` (used so that
+    frozen ticks under staggered resets do not perturb the statistics).
+    ``normalize`` returns ``(x - mean) / sqrt(var + 1e-8)``.
+    """
+
     @functools.partial(jax.jit, static_argnums=0)
     def init(self, tree: struct.PyTreeNode) -> NormalizationState:
         return NormalizationState(
@@ -240,7 +234,7 @@ class Normalizer:
 
 
 # =============================================================================
-# AutoResetWrapper + wrap_for_training (verbatim from REPPO source lines 32-82)
+# AutoResetWrapper + StaggeredResetWrapper + wrap_for_training
 # =============================================================================
 
 
@@ -279,7 +273,7 @@ class AutoResetWrapper(Wrapper):
 
 
 class StaggeredResetWrapper(Wrapper):
-    """Reset wrapper implementing the paper's 'reset gate' mechanism.
+    """Reset wrapper implementing reset gate mechanism.
 
     When ``state.info['active']`` is all-False (the pre-stagger phase),
     behaves identically to :class:`AutoResetWrapper`: any env whose new
@@ -289,7 +283,7 @@ class StaggeredResetWrapper(Wrapper):
     of an intrinsic termination (``done=True`` with ``truncation=0``):
 
     * ``reward`` and ``done=1`` and ``truncation=0`` are preserved — the
-      transition is a bona fide MDP terminal step (``valid_mask=True``).
+      transition is like a MDP terminal step (``valid_mask=True``).
     * The carry ``obs`` is reset to ``first_obs`` (via ``reset_mask``) so
       the *next* tick's env.step starts from a clean initial state.
     * ``is_waiting`` flips True so the next tick freezes cleanly.
@@ -339,8 +333,7 @@ class StaggeredResetWrapper(Wrapper):
         prev_steps = state.info["steps"]
         prev_group_step = state.info["group_step"]
 
-        # AutoReset convention: zero EpisodeWrapper's step counter where
-        # the incoming state is done=True, then clear done before stepping.
+        # Zero EpisodeWrapper's step counter where the incoming state is done=True, then clear done before stepping.
         state.info["steps"] = jnp.where(
             state.done, jnp.zeros_like(prev_steps), prev_steps
         )
@@ -398,7 +391,7 @@ class StaggeredResetWrapper(Wrapper):
         )
         obs_final = _where(reset_mask, state.info["first_obs"], obs_after_freeze)
 
-        # Bookkeeping.
+        # Bookkeeping
         group_step_final = jnp.where(
             gate_now, jnp.zeros_like(group_step_new), group_step_new
         )
@@ -453,31 +446,42 @@ def wrap_for_training(
 
 
 # =============================================================================
-# hl_gauss (verbatim from REPPO source lines 105-121)
+# hl_gauss
 # =============================================================================
 
 
 def hl_gauss(
     values: jax.Array, num_bins: int, vmin: float, vmax: float, epsilon: float = 0.0,
 ) -> jax.Array:
-    """Soft two-hot encoding of scalars into a categorical distribution."""
+    """HL-Gauss soft two-hot encoding.
+
+    Projects a scalar target into a categorical distribution over ``num_bins``
+    bins spanning ``[vmin, vmax]``. The target probability for each bin is the
+    mass a Gaussian (centered at the clipped scalar, width ~0.75 * bin_width)
+    places on that bin. This turns scalar TD targets into a categorical
+    target for cross-entropy regression of the critic logits.
+    """
+    # Clip the scalar into the support, optionally contracted by (1 - epsilon).
     x = jnp.clip(values, vmin, vmax).squeeze() / (1 - epsilon)
     bin_width = (vmax - vmin) / (num_bins - 1)
     sigma_to_final_sigma_ratio = 0.75
+    # Bin edges (one more edge than bins).
     support = jnp.linspace(
         vmin - bin_width / 2, vmax + bin_width / 2, num_bins + 1, dtype=jnp.float32,
     )
     sigma = bin_width * sigma_to_final_sigma_ratio
+    # Per-edge Gaussian CDF; per-bin mass = CDF(right_edge) - CDF(left_edge).
     cdf_evals = jax.scipy.special.erf((support - x) / (jnp.sqrt(2) * sigma))
     z = cdf_evals[-1] - cdf_evals[0]
     target_probs = cdf_evals[1:] - cdf_evals[:-1]
     target_probs = (target_probs / z).reshape(*values.shape[:-1], num_bins)
+    # Optional uniform smoothing for numerical stability (epsilon=0 by default).
     uniform = jnp.ones_like(target_probs) / num_bins
     return (1 - epsilon) * target_probs + epsilon * uniform
 
 
 # =============================================================================
-# Logging utilities (verbatim from reppo-gcrl/src/util.py)
+# Logging utilities
 # =============================================================================
 
 
@@ -522,25 +526,28 @@ def log_metrics(time_steps: int, eval_epoch: int, metrics: dict):
 # =============================================================================
 # Networks
 #
-# Structure (residual_block, SA_encoder, G_encoder, Actor residual tower) is
-# copied verbatim from crl-reppo/train.py lines 108-234 to preserve the exact
-# depth-scaling axis of Wang et al. "1000 Layer Networks" (NeurIPS 2025).
+# The residual-block stack (residual_block, SA_encoder, G_encoder) and the
+# Actor residual tower are copied from scaling-crl so this experiment shares
+# the same depth-scaling axis as the CRL paper for a fair comparison. The
+# Critic's post-encoder fusion head (HL-Gauss categorical return logits +
+# auxiliary next-embedding / next-reward head) is implemented here.
 #
-# Deviations from crl-reppo's Actor (intentional, per port plan):
-#   1. Actor.log_std is UNCLAMPED. crl-reppo applies a SAC-convention tanh
-#      rescale (`LOG_STD_MIN=-5`, `LOG_STD_MAX=2`). That is a behavioral prior
-#      on policy entropy, not structural architecture, and it fights REPPO's
-#      KL-bound Lagrangian + adaptive entropy temperature. Dropped.
-#   2. Actor registers REPPO's two scalar params (`log_lagrangian`,
-#      `log_temperature`) via `self.param` so the single actor optimizer
-#      trains them.
-#   3. Actor accepts `deterministic: bool = False`. On `deterministic=True`,
-#      returns `jnp.tanh(mean)` (matches crl-reppo's `deterministic_actor_step`
-#      eval convention).
-#
-# Critic is a new wrapper that re-uses crl-reppo's `SA_encoder` + `G_encoder`
-# (two-tower, fused 128-dim embedding) and bolts REPPO's HL-Gauss Q head +
-# aux prediction head on top. `zero_dist` is preserved as a trainable param.
+#   residual_block : Dense -> Norm -> Act, four times, with an identity
+#                    shortcut added at the end.
+#   SA_encoder     : concatenates (state, action), runs a Dense+Norm+Act
+#                    stem, then (network_depth // 4) residual blocks of
+#                    width network_width. Output: (B, network_width).
+#   G_encoder      : same as SA_encoder but on the goal slice only.
+#   Critic         : fuses SA and G encodings (concat -> Dense+Norm+Act)
+#                    and emits HL-Gauss categorical logits over return bins,
+#                    plus auxiliary predictions of the next embedding and
+#                    the next reward.
+#   Actor          : Dense stem + residual blocks, two Dense heads for the
+#                    mean and log_std of a tanh-squashed diagonal Gaussian.
+#                    Also carries two scalar log-parameters:
+#                      * log_lagrangian  = log(beta), the KL multiplier
+#                      * log_temperature = log(alpha), the entropy coef
+#   action_dist    : distrax tanh-Normal used for sampling and log-probs.
 # =============================================================================
 
 
@@ -629,10 +636,9 @@ class G_encoder(nn.Module):
 
 
 class Actor(nn.Module):
-    """crl-reppo residual Actor + REPPO param registration.
-
+    """
     Returns `(mean, log_std)` by default. With `deterministic=True`, returns
-    `jnp.tanh(mean)` (crl-reppo eval convention). `log_std` is unclamped.
+    `jnp.tanh(mean)`. `log_std` is unclamped.
     """
 
     action_size: int
@@ -646,11 +652,15 @@ class Actor(nn.Module):
 
     @nn.compact
     def __call__(self, x, deterministic: bool = False):
+        # Lagrange multiplier beta on the KL constraint (stored as log for
+        # positivity). Updated by the actor's lagrangian_loss.
         _ = self.param(
             "log_lagrangian",
             nn.initializers.constant(jnp.log(self.kl_start)),
             (1,),
         )
+        # Entropy coefficient alpha for the max-entropy objective (stored as
+        # log for positivity). Updated by the actor's target_entropy_loss.
         _ = self.param(
             "log_temperature",
             nn.initializers.constant(jnp.log(self.ent_start)),
@@ -675,24 +685,33 @@ class Actor(nn.Module):
         x = activation(x)
         for i in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
+        # Two heads: mean and log_std of a diagonal Gaussian. Samples are
+        # squashed through tanh by action_dist(mean, log_std).
         mean = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
 
         if deterministic:
+            # Evaluation path: pick the tanh-squashed mean as a point action.
             return jnp.tanh(mean)
         return mean, log_std
 
 
 class Critic(nn.Module):
-    """Two-tower SA+G encoders (crl-reppo) fused into REPPO's HL-Gauss head.
+    """Q(state, action, goal) with an HL-Gauss categorical return head.
 
-    Head outputs:
-      value          : expected return under softmax(logits) over HL-Gauss support
+    Two towers: SA_encoder encodes (state, action) and G_encoder encodes the
+    goal slice. Their outputs are concatenated and passed through a
+    Dense+Norm+Act fusion layer, which feeds:
+
+      value          : expected return under softmax(logits) over the
+                       HL-Gauss bin support
       logits         : raw categorical logits (num_bins)
       probs          : softmax(logits)
-      embed          : fused 128-dim embedding (64 SA + 64 G)
-      pred_features  : aux prediction of next-step fused embed (stop-grad target)
-      pred_rew       : aux scalar reward prediction
+      embed          : fused (SA, G) representation, also used as an
+                       auxiliary self-supervised target
+      pred_features  : auxiliary prediction of the next-step fused embed
+                       (trained by MSE against a stop-grad target)
+      pred_rew       : auxiliary scalar reward prediction
     """
 
     action_size: int
@@ -707,9 +726,13 @@ class Critic(nn.Module):
 
     @nn.compact
     def __call__(self, obs, action):
+        # The observation carries the goal spliced into its trailing slots;
+        # split it into the state slice and the goal slice.
         state = obs[..., : self.obs_dim]
         goal = obs[..., self.obs_dim :]
 
+        # Two independent residual towers: one for (state, action), one for
+        # the goal. Output width matches network_width.
         sa = SA_encoder(
             network_width=self.network_width,
             network_depth=self.network_depth,
@@ -723,17 +746,23 @@ class Critic(nn.Module):
             use_relu=self.use_relu,
         )(goal)
 
+        # Fuse the two encodings by concatenation: (B, 2 * network_width).
         fusion = jnp.concatenate([sa, g], axis=-1)
         fusion_dim = 2 * self.network_width
 
         normalize = lambda y: nn.LayerNorm()(y)
         activation = nn.relu if self.use_relu else nn.swish
 
+        # Fusion head: Dense -> Norm -> Act -> Dense to num_bins logits.
         q = nn.Dense(fusion_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(fusion)
         q = normalize(q)
         q = activation(q)
+        # Categorical logits over HL-Gauss return bins.
         logits = nn.Dense(self.num_bins, kernel_init=lecun_unfirom, bias_init=bias_init)(q)
 
+        # Learned bias of shape (num_bins,) initialized to HL-Gauss(0). Scaled
+        # by 40.0 so the untrained critic predicts value ~= 0 (the HL-Gauss
+        # bin concentrated at zero dominates the softmax at init).
         zero_dist = self.param(
             "zero_dist",
             lambda _rng, shape: hl_gauss(
@@ -743,10 +772,15 @@ class Critic(nn.Module):
         )
         logits = logits + zero_dist * 40.0
 
+        # Expected value under the categorical distribution over return bins:
+        # value = sum_b softmax(logits)_b * support_b.
         probs = jax.nn.softmax(logits, axis=-1)
         support = jnp.linspace(self.vmin, self.vmax, self.num_bins, endpoint=True)
         value = jnp.sum(probs * support, axis=-1)
 
+        # Auxiliary head off the same fused embedding. The final Dense emits
+        # (fusion_dim + 1) outputs: the first fusion_dim predict the next-step
+        # fused embedding, the last element predicts the next-step reward.
         pred = nn.Dense(fusion_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(fusion)
         pred = normalize(pred)
         pred = activation(pred)
@@ -774,11 +808,11 @@ def action_dist(mean: jax.Array, log_std: jax.Array) -> distrax.Distribution:
 
 
 # =============================================================================
-# Env registry (lifted verbatim from crl-reppo/train.py lines 322-504)
+# Env registry (copied verbatim from scaling-crl for fair comparison)
 #
-# Returns (env, obs_dim, goal_start_idx, goal_end_idx) rather than mutating an
-# Args object, so main() can fill Args once and the factory itself stays pure.
-# Every env branch is byte-equivalent to crl-reppo's make_env.
+# Each branch constructs a goal-conditioned Brax env and returns the
+# (obs_dim, goal_start_idx, goal_end_idx) slicing triple so downstream code
+# knows where the goal lives inside the concatenated observation.
 # =============================================================================
 
 
@@ -890,14 +924,16 @@ def make_env(env_id: str):
 # =============================================================================
 # Transition containers
 #
-# Transition        : crl-reppo NamedTuple; shape required by CrlEvaluator.
-# RolloutTransition : REPPO-style PyTreeNode; rich learner-facing struct with
-#                     raw_obs (next_obs), truncation flag, and env metrics.
+# Transition        : NamedTuple consumed by the evaluator; carries
+#                     (observation, action, reward, discount, extras).
+# RolloutTransition : rollout-time PyTree with extra fields for HER goal
+#                     relabeling (`next_obs`) and for staggered resets
+#                     (`valid_mask`, `truncated`).
 # =============================================================================
 
 
 class Transition(NamedTuple):
-    """crl-reppo-shaped tuple consumed by CrlEvaluator."""
+    """Evaluator-shaped transition tuple (shape matches the scaling-crl evaluator)."""
     observation: jnp.ndarray
     action: jnp.ndarray
     reward: jnp.ndarray
@@ -906,7 +942,11 @@ class Transition(NamedTuple):
 
 
 class RolloutTransition(struct.PyTreeNode):
-    """REPPO-shaped learner transition (from reppo_jaxgcrl.py lines 85-92).
+    """Rollout transition struct with extra fields for HER and staggered resets.
+
+    ``next_obs`` is the pre-auto-reset next observation so that HER goal
+    relabeling can read the achieved goal from the true continuation, even
+    when the env has just been auto-reset.
 
     ``valid_mask`` marks transitions that should contribute to learning
     losses. False for frozen steps (when an env is idling for its group's
@@ -926,15 +966,15 @@ class RolloutTransition(struct.PyTreeNode):
 # =============================================================================
 # HER helpers (closures over goal_indices, goal_dim, goal_reach_thresh, args).
 #
-# Verbatim ports of reppo_jaxgcrl.py lines 577-698. The factory pattern
-# `make_her_helpers(...)` mirrors REPPO's inline-in-learner_fn scoping.
+# Achieved goals are read from `obs[..., goal_indices]` (a contiguous range
+# inside the state block, set per-env by make_env).
 #
-# Semantics note (crl-reppo obs layout):
-#   Goals live at `obs[..., args.obs_dim:]` (length = goal_dim).
-#   `obs[..., -goal_dim:]` is equivalent because obs.shape[-1] = obs_dim + goal_dim,
-#   so REPPO's `.at[..., -goal_dim:].set(new_goal)` still targets the correct
-#   slice. Achieved goals are extracted from `obs[..., goal_indices]` which for
-#   crl-reppo envs is a contiguous range inside the state block.
+# replace_goal_in_obs : splice a new goal into the trailing goal_dim slots.
+# compute_goal_reward : sparse 0/1 reward = 1{ ||achieved - goal|| < thresh }.
+# her_augment         : "future" strategy - for each step t, sample k future
+#                       achieved states from the same episode segment and
+#                       return the augmented tensors.
+# td0_targets         : one-step TD(0) target r + gamma * (1 - done) * V.
 # =============================================================================
 
 
@@ -953,20 +993,26 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
         return (dist < goal_reach_thresh).astype(jnp.float32)
 
     def her_augment(key, batch: RolloutTransition):
-        """HER 'future' strategy: sample k hindsight goals from same episode.
+        """HER 'future' strategy: sample k hindsight goals per step.
 
-        Gumbel top-k on valid future offsets; supports both 'uniform' and
-        'geometric' sampling. Invalid samples (fewer than k future steps)
-        have truncated=1.0 so they are zeroed in critic loss.
+        For each step t in each env, sample k indices from the remaining
+        segment [t, end_idx[t]] (up to episode boundary), and take the
+        achieved goal at each sampled step as a hindsight goal. Supports
+        uniform or geometric sampling over future offsets. Slots with fewer
+        than k available future steps are marked with weight=0 and
+        truncated=1 so they are zeroed out of the critic loss.
 
         Returns (obs_alt, next_obs_alt, reward_alt, done_alt, trunc_alt,
                  weight_alt, g_alt, end_idx).
         """
         S, E, k = args.num_steps, args.num_envs, args.her_k
 
+        # An episode boundary occurs when done=1 (terminal) or truncated=1.
         boundaries = jnp.maximum(batch.done, batch.truncated)
         step_idx = jnp.broadcast_to(jnp.arange(S)[:, None], (S, E))
 
+        # Reverse scan: end_idx[t, e] = smallest t' >= t with boundaries=1
+        # (or S-1 if no boundary before the rollout ends).
         def scan_end(carry, x):
             t, b = x
             end = jnp.where(b, t, carry)
@@ -979,41 +1025,61 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
             reverse=True,
         )
 
+        # Gumbel top-k over offsets in [0, S): samples k distinct offsets
+        # without replacement, weighted by log_weights + Gumbel noise.
         range_size = end_idx - step_idx + 1
         offsets_range = jnp.arange(S)
         gumbel = -jnp.log(
             -jnp.log(jnp.clip(jax.random.uniform(key, (S, E, S)), 1e-20, 1.0 - 1e-7))
         )
         if args.her_goal_sampling == "geometric":
+            # Geometric weighting log_w = offset * log(gamma) biases toward
+            # near-term future steps (more weight on small offsets).
             log_weights = offsets_range * jnp.log(args.gamma)
         else:
+            # Uniform sampling: every future offset in the segment is equally likely.
             log_weights = jnp.zeros(S)
         scores = log_weights[None, None, :] + gumbel
+        # Mask out offsets that reach past the episode boundary.
         valid_offsets = offsets_range[None, None, :] < range_size[:, :, None]
         scores = jnp.where(valid_offsets, scores, -1e9)
         _, top_offsets = jax.lax.top_k(scores, k)
         future_idx = step_idx[:, :, None] + top_offsets
 
+        # A hindsight slot is valid if the segment had at least (j+1) future
+        # steps. Invalid slots are zeroed out of the loss below.
         valid = jnp.arange(k)[None, None, :] < jnp.minimum(k, range_size)[:, :, None]
 
+        # Gather the achieved goal at each sampled future step; this is the
+        # hindsight goal for the (t, j) slot.
         env_idx = jnp.broadcast_to(jnp.arange(E)[None, :, None], future_idx.shape)
         g_alt = batch.next_obs[future_idx, env_idx][..., goal_indices]
 
+        # Splice g_alt into the trailing goal slots of obs and next_obs.
         obs_alt = replace_goal_in_obs(batch.obs[:, :, None, :], g_alt)
         next_obs_alt = replace_goal_in_obs(batch.next_obs[:, :, None, :], g_alt)
 
+        # Hindsight reward is the sparse indicator for the new goal.
         reward_alt = compute_goal_reward(batch.next_obs[:, :, None, :], g_alt)
 
+        # term = true terminal (done & not truncated). Truncations carry
+        # through as the truncated flag below; this keeps the TD bootstrap
+        # well-defined at time-limit boundaries.
         term = batch.done * (1.0 - batch.truncated)
         done_alt = jnp.broadcast_to(term[:, :, None], (S, E, k))
 
         trunc_alt = jnp.broadcast_to(batch.truncated[:, :, None], (S, E, k))
+        # Invalid slots are marked truncated=1 so (1 - truncated) zeros them in L_Q.
         trunc_alt = jnp.where(valid, trunc_alt, 1.0)
 
         if args.normalize_hindsight_loss:
+            # Weight each valid slot by 1/m_t so each step contributes a
+            # total hindsight mass of 1 regardless of how many valid slots
+            # it has.
             m_t = jnp.minimum(k, range_size)
             weight_alt = jnp.where(valid, 1.0 / m_t[:, :, None], 0.0)
         else:
+            # Every valid slot contributes with weight 1.
             weight_alt = jnp.where(valid, 1.0, 0.0)
         return (
             obs_alt,
@@ -1027,7 +1093,7 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
         )
 
     def td0_targets(soft_reward, next_value, done):
-        """TD0 targets for HER trajectory (no lambda blending)."""
+        """One-step TD(0) target: r_tilde + gamma * (1 - done) * V(next)."""
         return soft_reward + args.gamma * (1.0 - done) * next_value
 
     return replace_goal_in_obs, compute_goal_reward, her_augment, td0_targets
@@ -1037,15 +1103,24 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
 # TD-lambda target helpers (closures over args, actor, critic, normalizer,
 # goal_indices, goal_reach_thresh, replace_goal_in_obs, fusion_dim).
 #
-# Ports of reppo_jaxgcrl.py lines 996-1046 (nstep_lambda, compute_extras),
-# lines 673-698 (compute_extras_alt), and lines 700-850
-# (compute_alt_td_lambda_targets_k — reverse scan + IS accumulation).
-#
-# Deltas from source:
-#   * nnx.merge(...)+actor_model(...) -> actor.apply(params, obs) + action_dist(...)
-#   * actor_model.temperature()       -> jnp.exp(params['params']['log_temperature'])
-#   * fusion_dim = 2 * critic_network_width (512 by default); encoders return
-#     their residual-tower width directly, no post-residual Dense(64).
+# nstep_lambda                    : reverse-scan TD-lambda return on the
+#                                   original trajectory. Skips freeze ticks
+#                                   but keeps boundary (truncated / done)
+#                                   ticks so they bootstrap earlier ticks.
+# compute_extras                  : for the original trajectory, compute the
+#                                   max-entropy soft reward
+#                                      r - gamma * alpha * log pi(a_{t+1})
+#                                   and V(next) averaged over
+#                                   num_action_samples samples from
+#                                   pi(. | next_obs).
+# compute_extras_alt              : same as above but for a hindsight
+#                                   trajectory with fresh actions sampled
+#                                   under the alt goal.
+# compute_alt_td_lambda_targets_k : IS-corrected TD-lambda target for one
+#                                   k-slot of hindsight goals, built in a
+#                                   single reverse scan (see inline comments
+#                                   for the per-decision ratio rho and the
+#                                   interior / boundary recursions).
 # =============================================================================
 
 
@@ -1070,13 +1145,19 @@ def make_td_lambda_helpers(
         return jnp.exp(actor_params["params"]["log_temperature"])
 
     def nstep_lambda(batch):
+        """Reverse-scan TD-lambda return using the max-entropy soft reward."""
         def loop(returns, transition):
             done = transition.done
             reward = transition.extras["soft_reward"]
             next_value = transition.extras["next_value"]
             truncated = transition.truncated
             valid = transition.valid_mask
+            # Lambda mixes the upstream return (lambda) with the bootstrap
+            # V(next) (1 - lambda). lambda=1 recovers the Monte-Carlo
+            # return; lambda=0 recovers TD(0).
             lambda_sum = args.lmbda * returns + (1 - args.lmbda) * next_value
+            # At a truncation (time-limit): bootstrap only.
+            # Otherwise: r_tilde + gamma * (1 - done) * lambda_sum.
             lambda_return = reward + args.gamma * jnp.where(
                 truncated, next_value, (1.0 - done) * lambda_sum
             )
@@ -1087,6 +1168,8 @@ def make_td_lambda_helpers(
             lambda_return = jnp.where(skip, returns, lambda_return)
             return lambda_return, lambda_return
 
+        # Reverse scan across time. init = V(next) at the last rollout step,
+        # so the final step's target is r_tilde + gamma * V(next).
         _, lambda_return = jax.lax.scan(
             f=loop,
             init=batch.extras["next_value"][-1],
@@ -1096,14 +1179,18 @@ def make_td_lambda_helpers(
         return lambda_return
 
     def compute_extras(key, train_state, batch):
-        """Compute soft reward and next value for original trajectory."""
+        """Compute max-entropy soft reward and V(next) for the original trajectory."""
         actor_params = train_state.actor_state.params
         critic_params = train_state.critic_state.params
         alpha = _alpha(actor_params)
 
+        # Next-action distribution evaluated at next_obs. Used twice below.
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, batch.next_obs)
         next_action = next_pi.sample(seed=next_act_key)
+        # At episode boundaries (done or truncated), batch.action[t+1] is
+        # from a new episode, so fall back to a fresh sample. Otherwise
+        # use the action actually executed at t+1 in the rollout.
         boundary_mask = jnp.maximum(batch.truncated, batch.done)
         true_next_action = jnp.where(
             boundary_mask[..., None],
@@ -1112,8 +1199,11 @@ def make_td_lambda_helpers(
         )
         true_next_action = jnp.clip(true_next_action, -0.999, 0.999)
         true_next_log_prob = next_pi.log_prob(true_next_action)
+        # Max-entropy soft reward: r_t - gamma * alpha * log pi(a_{t+1}).
         soft_reward = batch.reward - args.gamma * true_next_log_prob * alpha
 
+        # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
+        # estimated with num_action_samples draws to reduce variance.
         key, next_act_key = jax.random.split(key)
         next_sample_actions = next_pi.sample(
             seed=next_act_key, sample_shape=(args.num_action_samples,)
@@ -1124,6 +1214,8 @@ def make_td_lambda_helpers(
             next_sample_actions,
         )
         next_values = next_critic_output["value"].mean(0)
+        # next_emb is used as the stop-grad target for the critic's
+        # auxiliary next-embedding prediction head.
         next_emb = next_critic_output["embed"][0]
 
         return {
@@ -1133,22 +1225,27 @@ def make_td_lambda_helpers(
         }
 
     def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt):
-        """Compute extras for HER trajectory: soft reward and next value only.
+        """Soft reward and V(next) for a hindsight trajectory under g_alt.
 
-        Always samples fresh actions from pi(.|x_{t+1}, g_alt) — no action
-        shifting; no IS correction (caller re-derives IS upstream if needed).
+        The rollout action at t+1 was executed under the original goal, not
+        under g_alt, so we always sample a fresh action from pi(. | x_{t+1},
+        g_alt) for both the max-entropy correction and the V(next) estimate.
         """
         actor_params = train_state.actor_state.params
         critic_params = train_state.critic_state.params
         alpha = _alpha(actor_params)
 
+        # Fresh action under the alt goal. Used for both the log-prob
+        # correction and the V(next) estimate below.
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, next_obs_alt)
         next_action = next_pi.sample(seed=next_act_key)
         next_action = jnp.clip(next_action, -0.999, 0.999)
         next_log_prob = next_pi.log_prob(next_action)
+        # Max-entropy soft reward using the fresh action's log-prob.
         soft_reward = reward_alt - args.gamma * next_log_prob * alpha
 
+        # V(next) averaged over num_action_samples draws from pi(.|x, g_alt).
         key, next_act_key = jax.random.split(key)
         next_sample_actions = next_pi.sample(
             seed=next_act_key, sample_shape=(args.num_action_samples,)
@@ -1170,11 +1267,24 @@ def make_td_lambda_helpers(
     def compute_alt_td_lambda_targets_k(
         key, train_state, batch_raw, norm_state, g_alt_k, end_idx,
     ):
-        """IS-corrected TD-lambda targets for one k-slot of HER goals.
+        """IS-corrected TD-lambda targets for one slot of hindsight goals.
 
-        Single reverse scan: computes forward values at each step u on-the-fly
-        and immediately feeds them into the backward TD-lambda recursion.
-        Memory is O(S*E), not O(S^2*E).
+        For each starting time t and each env, the target G_t^{alt} is built
+        over the remainder of the same episode segment [t, end_idx[t]] with:
+          * reward_u = 1{ ||achieved(next_obs_u) - g_alt|| < thresh }
+          * soft reward subtracts gamma * alpha * log pi under g_alt
+          * per-decision IS ratio
+              rho_{u+1} = min(1, pi(a_{u+1} | x_{u+1}, g_alt)
+                              / pi(a_{u+1} | x_{u+1}, g_orig))
+            corrects for the action mismatch between g_alt and g_orig
+          * at u = end_idx[t]: bootstrap only (truncation case uses V,
+            otherwise (1-term)*V)
+          * at u < end_idx[t] (interior):
+              G_u = r_tilde_u + gamma * (1 - term_u)
+                    * ((1 - lambda * rho) * V_u + lambda * rho * G_{u+1})
+
+        Implemented as a single reverse scan over u so peak memory is O(S*E)
+        rather than the O(S^2*E) of a naive per-t inner loop.
 
         Returns (stop_grad(G_final), mean_rho, stop_grad(next_emb_final)).
         """
@@ -1183,6 +1293,8 @@ def make_td_lambda_helpers(
         critic_params = train_state.critic_state.params
         alpha = jax.lax.stop_gradient(_alpha(actor_params))
 
+        # Log-prob of each rolled-out action under the frozen behavior
+        # policy evaluated at the original goal. Denominator of the IS ratio.
         norm_obs = normalizer.normalize(norm_state, batch_raw.obs)
         orig_pi = _actor_dist(actor_params, norm_obs)
         orig_log_probs = orig_pi.log_prob(
@@ -1192,9 +1304,12 @@ def make_td_lambda_helpers(
         t_idx = jnp.arange(S)[:, None]
 
         def scan_step(carry, u):
+            """Process step u once; update G at every t that covers u."""
             G, rng, rho_sum, rho_count, next_emb_acc = carry
             rng, act_key = jax.random.split(rng)
 
+            # Build next_obs with g_alt spliced in, then normalize it so
+            # the networks receive properly-scaled inputs.
             raw_next = batch_raw.next_obs[u]
             raw_next_exp = jnp.broadcast_to(
                 raw_next[None, :, :], (S, E, raw_next.shape[-1])
@@ -1202,11 +1317,16 @@ def make_td_lambda_helpers(
             obs_alt_u = replace_goal_in_obs(raw_next_exp, g_alt_k)
             obs_alt_u = normalizer.normalize(norm_state, obs_alt_u)
 
+            # Fresh action a' ~ pi(. | x_{u+1}, g_alt). Used for V_u and
+            # for the boundary max-entropy correction.
             pi_alt = _actor_dist(actor_params, obs_alt_u)
             fresh_action = pi_alt.sample(seed=act_key)
             fresh_action = jnp.clip(fresh_action, -0.999, 0.999)
             fresh_log_prob = pi_alt.log_prob(fresh_action)
 
+            # Rolled-out action at step u+1 (clamped to the open interval to
+            # keep the tanh-Gaussian log-prob finite). Numerator of the IS
+            # ratio is evaluated at this action.
             a_next = batch_raw.action[jnp.minimum(u + 1, S - 1)]
             a_next_clipped = jnp.clip(a_next, -1 + 1e-4, 1 - 1e-4)
             a_next_exp = jnp.broadcast_to(
@@ -1214,25 +1334,36 @@ def make_td_lambda_helpers(
             )
             is_num_log = pi_alt.log_prob(a_next_exp)
 
+            # Q(next_obs_alt, a') and the fused embedding at step u.
             critic_out = critic.apply(critic_params, obs_alt_u, fresh_action)
             V_u = critic_out["value"]
             embed_u = critic_out["embed"]
 
+            # Hindsight reward at step u: 1 if the achieved state at u+1
+            # is within threshold of g_alt, else 0.
             achieved = raw_next[:, goal_indices]
             dist = jnp.linalg.norm(achieved[None, :, :] - g_alt_k, axis=-1)
             reward_u = (dist < goal_reach_thresh).astype(jnp.float32)
 
+            # Per-decision IS ratio, clipped at 1 for variance reduction.
+            #   rho = min(1, pi(a_{u+1}|x_{u+1}, g_alt)
+            #              / pi(a_{u+1}|x_{u+1}, g_orig))
             is_denom = orig_log_probs[jnp.minimum(u + 1, S - 1)]
             log_rho = is_num_log - is_denom[None, :]
             rho = jnp.minimum(1.0, jnp.exp(log_rho))
 
             if args.sample_new_action_for_tdL:
+                # Use the fresh-action log-prob for both boundary and interior.
                 soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
                 soft_r_int = soft_r_bnd
             else:
+                # Boundary: fresh-action log-prob. Interior: behavior-action
+                # log-prob weighted by the IS ratio (per-decision correction).
                 soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
                 soft_r_int = reward_u - args.gamma * alpha * rho * is_denom[None, :]
 
+            # For each t, u is the segment boundary if u == end_idx[t, e],
+            # and is an interior step if t <= u < end_idx[t, e].
             end = end_idx
             is_boundary = (u == end)
             is_interior = (t_idx <= u) & (u < end)
@@ -1241,15 +1372,19 @@ def make_td_lambda_helpers(
             valid_b = valid_u[None, :]
             valid_f = valid_b.astype(rho.dtype)
 
+            # Track the mean clipped IS ratio over interior ticks (logged).
             rho_sum = rho_sum + jnp.sum(rho * is_interior * valid_f)
             rho_count = rho_count + jnp.sum(is_interior * valid_f)
 
             term_u = batch_raw.done[u]
             trunc_u = batch_raw.truncated[u]
 
+            # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
             G_bnd = soft_r_bnd + args.gamma * jnp.where(
                 trunc_u[None, :], V_u, (1.0 - term_u[None, :]) * V_u
             )
+            # Interior target: r_tilde + gamma * (1 - term)
+            #                           * ((1 - lambda*rho)*V + lambda*rho*G).
             G_int = soft_r_int + args.gamma * jnp.where(
                 trunc_u[None, :],
                 V_u,
@@ -1259,7 +1394,7 @@ def make_td_lambda_helpers(
 
             # Allow the scan to write at episode-boundary ticks (gate ticks
             # carry truncated=1 with valid_mask=0) so G_bnd still flows
-            # backward into the interior's λρ·G term at earlier ticks.
+            # backward into the interior's lambda * rho * G term at earlier ticks.
             boundary_u = (term_u[None, :] > 0) | (trunc_u[None, :] > 0)
             write_allowed = valid_b | boundary_u
             G_new = jnp.where(
@@ -1267,11 +1402,15 @@ def make_td_lambda_helpers(
             )
             G_new = jnp.where(write_allowed, G_new, G)
 
+            # Save the fused embedding for the critic's auxiliary target,
+            # but only at the original step u == t and only on valid ticks.
             write_emb = ((u == t_idx) & valid_b)[..., None]
             next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
 
             return (G_new, rng, rho_sum, rho_count, next_emb_acc), None
 
+        # Reverse scan across u from S-1 down to 0 so G at the interior
+        # recursion always sees the already-updated G_{u+1}.
         (G_final, _, rho_sum, rho_count, next_emb_final), _ = jax.lax.scan(
             scan_step,
             (
@@ -1300,9 +1439,7 @@ def make_td_lambda_helpers(
 
 
 # =============================================================================
-# Stagger helpers (closures over args, env). Ports of reppo_jaxgcrl.py lines
-# 391-573. Only `stagger_mode='grouped'` with `stagger_warmup_policy='random'`
-# is implemented — other combinations raise ValueError.
+# Stagger helpers
 # =============================================================================
 
 
@@ -1548,19 +1685,7 @@ def make_stagger_helpers(args: "Args", env):
 
 
 # =============================================================================
-# Losses + epoch runners (closures over args, actor, critic, action_size).
-#
-# Ports of reppo_jaxgcrl.py lines 854-994 (critic_loss, actor_loss,
-# compute_policy_kl, update_critic, update_actor) and lines 1050-1149
-# (run_epoch, run_epoch_separate).
-#
-# Deltas from source:
-#   * nnx.merge(...)+call -> actor.apply(params, obs) + action_dist(...)
-#   * actor_model.temperature() -> jnp.exp(params['params']['log_temperature'])
-#   * actor_model.lagrangian()  -> jnp.exp(params['params']['log_lagrangian'])
-#   * train_state.critic / actor become critic_state / actor_state.
-#   * util.prefix_dict -> prefix_dict (in-file).
-#   * optax.zero_nans NOT used (per plan); jnp.nan_to_num kept on actor grads.
+# Losses + epoch runners
 # =============================================================================
 
 
@@ -1573,16 +1698,22 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         return action_dist(mean, log_std)
 
     def critic_loss(params, train_state, minibatch):
+        """HL-Gauss categorical cross-entropy loss plus next-emb / reward aux."""
         critic_output = critic.apply(params, minibatch.obs, minibatch.action)
         target_values = minibatch.extras["target_values"]
+        # Project scalar TD-lambda targets into categorical HL-Gauss bins.
         target_cat = jax.vmap(hl_gauss, in_axes=(0, None, None, None))(
             target_values, args.num_bins, args.vmin, args.vmax
         )
         critic_pred = critic_output["logits"]
+        # Main critic loss: cross-entropy between logits and soft two-hot target.
         critic_update_loss = optax.softmax_cross_entropy(critic_pred, target_cat)
         value = critic_output["value"]
         critic_mse = jnp.mean(optax.squared_error(value, target_values))
 
+        # Auxiliary losses: predict the next-step fused embedding and the
+        # next-step reward, regressed by MSE against stop-grad targets.
+        # Masked by (1 - done) so terminal steps do not train the predictors.
         pred = critic_output["pred_features"]
         pred_rew = critic_output["pred_rew"]
         aux_loss = optax.squared_error(pred, minibatch.extras["next_emb"])
@@ -1593,6 +1724,9 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
             axis=-1,
         )
 
+        # Weighted mean over the minibatch: w = 1 for original samples,
+        # w = 1/m_t (or 1) for hindsight samples. (1 - truncated) zeroes
+        # out time-limit and invalid-slot transitions.
         w = minibatch.extras["weight"]
         loss = jnp.sum(
             w
@@ -1612,37 +1746,59 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         )
 
     def compute_policy_kl(minibatch, pi, old_pi):
+        """Sample-based KL(old_pi || pi) estimator using 4 action samples."""
+        # Draw 4 actions under old_pi; clamp them to the valid tanh range.
         old_pi_action, old_pi_act_log_prob = old_pi.sample_and_log_prob(
             sample_shape=(4,), seed=minibatch.extras["kl_key"]
         )
         old_pi_action = jnp.clip(old_pi_action, -1 + 1e-4, 1 - 1e-4)
+        # KL(old || pi) ~ mean_a[ log old_pi(a) - log pi(a) ], a ~ old_pi.
         old_pi_act_log_prob = old_pi_act_log_prob.mean(0)
         pi_act_log_prob = pi.log_prob(old_pi_action).mean(0)
         kl = old_pi_act_log_prob - pi_act_log_prob
         return kl
 
     def actor_loss(params, train_state, minibatch):
+        """Actor loss with KL trust region, entropy target, and Lagrangian update.
+
+        Four additive pieces:
+          * per_actor_loss  (Q-branch, pathwise): alpha * log pi(a') - Q(x, a')
+              where a' ~ pi(.|x). Trains pi toward high soft-Q.
+          * kl * stopgrad(lagrangian)  (KL branch, active when the estimated
+              KL(old_pi || pi) >= kl_bound): pulls pi back toward the frozen
+              behavior policy.
+          * target_entropy_loss = temperature * stopgrad(entropy_target
+              + entropy): grows alpha when entropy drops below target.
+          * lagrangian_loss    = -lagrangian * stopgrad(kl - kl_bound):
+              grows beta when the estimated KL exceeds kl_bound.
+        """
         critic_params = train_state.critic_state.params
         actor_target_params = train_state.actor_target_params
 
+        # Current and frozen behavior policies at the same observations.
         pi = _actor_dist(params, minibatch.obs)
         old_pi = _actor_dist(actor_target_params, minibatch.obs)
 
         w = minibatch.extras["weight"]
         w_sum = jnp.maximum(w.sum(), 1.0)
 
+        # Per-sample KL(old_pi || pi) estimate.
         kl = compute_policy_kl(minibatch=minibatch, pi=pi, old_pi=old_pi)
         alpha = jax.lax.stop_gradient(jnp.exp(params["params"]["log_temperature"]))
+        # Pathwise DPG-style Q-branch: sample a' from pi, evaluate Q(x, a').
         pred_action, log_prob = pi.sample_and_log_prob(
             seed=minibatch.extras["action_key"]
         )
         critic_pred = critic.apply(critic_params, minibatch.obs, pred_action)
         value = critic_pred["value"]
+        # Q-branch loss: alpha * log pi(a') - Q(x, a').
         per_actor_loss = log_prob * alpha - value
         entropy = -log_prob
         action_size_target = action_size * args.ent_target_mult
         lagrangian = jnp.exp(params["params"]["log_lagrangian"])
 
+        # If KL < kl_bound: train with the Q-branch (pathwise).
+        # Otherwise: train with the KL-branch, scaled by the detached Lagrangian.
         per_sample_loss = jnp.where(
             kl < args.kl_bound,
             per_actor_loss,
@@ -1650,10 +1806,12 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         )
         loss = jnp.sum(w * per_sample_loss) / w_sum
 
+        # Entropy-temperature update: alpha grows when entropy drops below target.
         target_entropy = action_size_target + entropy
         temperature = jnp.exp(params["params"]["log_temperature"])
         target_entropy_loss = temperature * jax.lax.stop_gradient(target_entropy)
 
+        # Lagrangian update: beta grows when the estimated KL exceeds kl_bound.
         lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - args.kl_bound)
 
         loss += jnp.sum(w * target_entropy_loss) / w_sum
@@ -1808,7 +1966,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
 
 @flax.struct.dataclass
 class ReppoTrainingState:
-    """Training state for REPPO-GCRL on crl-reppo's depth-scaling benchmarks."""
+    """Training state: networks, optimizer state, RMS stats, and last env state."""
     env_steps: jnp.ndarray
     valid_env_steps: jnp.ndarray
     iteration: jnp.ndarray
@@ -1834,13 +1992,16 @@ def save_params(path: str, params: Any):
 # =============================================================================
 # Training driver
 #
-# `train(args)` is the monolithic trainer: builds env, networks, normalizer,
-# optimizers, helper factories, then defines init / rollout / learner / step
-# closures and runs the eval-interleaved Python outer loop.
+# train(args): end-to-end trainer. Builds env, networks, normalizer,
+# optimizers and helper closures, then runs an eval-interleaved outer loop:
 #
-# Mirrors reppo_jaxgcrl.py's `create_trainer(cfg)` (lines 250-1453). Metric
-# keys match the REPPO baseline layout (`training/*`, `eval/*`) so wandb
-# dashboards carry over.
+#     for eval_epoch in range(num_evals):
+#         training_epoch       # jit-scanned train_step over eval_interval iters
+#         evaluator.run_evaluation
+#         log + checkpoint
+#
+# Each train_step = one rollout + one learner_fn call (N_epochs of SGD
+# over the collected batch).
 # =============================================================================
 
 
@@ -1917,11 +2078,6 @@ def train(args: Args):
     )
 
     # --- Optimizers -------------------------------------------------------
-    # NOTE: `transition_steps=total_time_steps` matches REPPO source exactly
-    # (lines 300-310). Because `num_mini_batches * num_epochs` gradient steps
-    # are taken per rollout, optax counts grad steps while `total_time_steps`
-    # is denominated in env steps — annealing completes much faster than the
-    # nominal schedule suggests. Preserved for parity with REPPO baselines.
     if args.anneal_lr:
         actor_lr = optax.linear_schedule(
             init_value=args.actor_lr,
@@ -2025,18 +2181,29 @@ def train(args: Args):
 
     # --- Policy + rollout -------------------------------------------------
     def policy(key, obs, train_state: ReppoTrainingState):
+        """Stochastic rollout policy: normalize obs, sample from tanh-Gaussian."""
         obs = normalizer.normalize(train_state.normalization_state, obs)
         mean, log_std = actor.apply(train_state.actor_state.params, obs)
         pi = action_dist(mean, log_std)
         return pi.sample(seed=key)
 
     def collect_rollout(key, train_state: ReppoTrainingState):
+        """Scan num_steps env steps with the current stochastic policy.
+
+        Each tick: sample a ~ pi(.|x), clamp to the tanh-Gaussian's valid
+        range, step the env, and emit a RolloutTransition. ``next_obs`` is
+        the env's ``raw_obs`` (pre-auto-reset next observation), so HER can
+        still read the true achieved goal even on ticks that just terminated.
+        """
         def step_env(carry, _):
             key, env_state = carry
             key, act_key = jax.random.split(key)
             action = policy(act_key, env_state.obs, train_state)
+            # Clip strictly inside the tanh range for a finite log-prob.
             action = jnp.clip(action, -0.999, 0.999)
             next_env_state = env.step(env_state, action)
+            # valid_mask is only meaningful under staggered resets; it is
+            # all-True under AutoResetWrapper (the default).
             valid_mask = next_env_state.info.get(
                 "valid_mask",
                 jnp.ones_like(next_env_state.done, dtype=jnp.bool_),
@@ -2064,6 +2231,8 @@ def train(args: Args):
             length=args.num_steps,
         )
         _, last_env_state = rollout_state
+        # Track both total env steps and valid-only env steps (they differ
+        # only under staggered resets, where frozen ticks do not count).
         valid_count = jnp.sum(transitions.valid_mask.astype(jnp.int32))
         train_state = train_state.replace(
             last_env_state=last_env_state,
@@ -2074,10 +2243,12 @@ def train(args: Args):
 
     # --- Learner ----------------------------------------------------------
     def learner_fn(key, train_state: ReppoTrainingState, batch: RolloutTransition):
+        """Process one rollout batch: build targets, then run N_epochs of SGD."""
         S, E = args.num_steps, args.num_envs
         N = S * E
         k = args.her_k
 
+        # --- 1. HER augmentation: sample k hindsight goals per step ---
         if args.use_her_critic:
             key, her_key = jax.random.split(key)
             (
@@ -2091,13 +2262,21 @@ def train(args: Args):
                 end_idx,
             ) = her_augment(her_key, batch)
 
+        # Save the raw (un-normalized) batch; compute_alt_td_lambda_targets_k
+        # needs it because it normalizes obs internally with different goals.
         if args.use_her_td_lambda:
             batch_raw = batch
 
+        # --- 2. Update running observation normalizer (mask-aware) ---
+        # The update uses the fresh batch; the batch itself is normalized
+        # below with the *pre-update* stats so targets and losses are
+        # consistent with the stats the networks were trained on.
         new_norm_state = normalizer.update_masked(
             train_state.normalization_state, batch.obs, batch.valid_mask
         )
         norm_state = train_state.normalization_state
+
+        # --- 3. Normalize observations for the networks ---
         if args.use_her_critic:
             obs_alt = normalizer.normalize(norm_state, obs_alt_raw)
             next_obs_alt = normalizer.normalize(norm_state, next_obs_alt_raw)
@@ -2107,20 +2286,25 @@ def train(args: Args):
         )
         train_state = train_state.replace(normalization_state=new_norm_state)
 
+        # --- 4. Original trajectory: soft rewards, V(next), and TD-lambda targets ---
         key, orig_key = jax.random.split(key)
         extras_orig = compute_extras(key=orig_key, train_state=train_state, batch=batch)
         batch.extras.update(extras_orig)
         batch.extras["target_values"] = jax.lax.stop_gradient(nstep_lambda(batch=batch))
 
+        # --- 5. Freeze the target policy used by the actor's KL branch ---
         train_state = train_state.replace(
             actor_target_params=train_state.actor_state.params
         )
 
         is_ratio_mean = None
+        # --- 6. Hindsight targets: IS-corrected TD-lambda or plain TD(0) ---
         if args.use_her_critic:
             key, alt_key = jax.random.split(key)
 
             if args.use_her_td_lambda:
+                # Full TD-lambda target over the remaining segment with
+                # per-decision IS ratio. One scan step per hindsight slot.
                 def _compute_alt_targets_lambda(rng, g_alt_single_k):
                     rng, k_key = jax.random.split(rng)
                     tv_k, mean_rho_k, next_emb_k = compute_alt_td_lambda_targets_k(
@@ -2142,6 +2326,7 @@ def train(args: Args):
                 target_values_alt = jnp.moveaxis(target_values_alt_k, 0, 2)
                 next_emb_alt = jnp.moveaxis(next_emb_alt_k, 0, 2)
             else:
+                # Simpler one-step TD(0) target using a fresh action under g_alt.
                 def _compute_alt_targets(rng, inputs):
                     obs_k, next_obs_k, reward_k, done_k = inputs
                     rng, k_key = jax.random.split(rng)
@@ -2170,9 +2355,13 @@ def train(args: Args):
                 target_values_alt = jnp.moveaxis(target_values_alt_k, 0, 2)
                 next_emb_alt = jnp.moveaxis(next_emb_alt_k, 0, 2)
 
+            # --- 7. Build the combined batch: original (S*E rows, w=1) plus
+            #        hindsight (k*S*E rows, w = 1 or 1/m_t) flattened over time/env ---
             batch.extras["weight"] = batch.valid_mask.astype(jnp.float32)
             orig_flat = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
+            # The behavior action is the same for every hindsight slot at a
+            # given (t, e), so broadcast it across the k axis.
             action_alt = jnp.broadcast_to(
                 batch.action[:, :, None, :], (S, E, k, batch.action.shape[-1])
             )
@@ -2206,7 +2395,10 @@ def train(args: Args):
                 lambda o, a: jnp.concatenate([o, a], axis=0), orig_stripped, alt_flat
             )
 
+            # --- 8. Run num_epochs of SGD on the combined batch ---
             if args.use_her_actor:
+                # Actor sees hindsight samples too: both critic and actor use
+                # the full combined batch.
                 key, train_key = jax.random.split(key)
                 train_state, update_metrics = jax.lax.scan(
                     f=lambda ts, k_: run_epoch(k_, ts, combined_batch),
@@ -2214,6 +2406,8 @@ def train(args: Args):
                     xs=jax.random.split(train_key, args.num_epochs),
                 )
             else:
+                # Actor sees only the original S*E samples; critic sees the
+                # combined (1 + k)*S*E batch.
                 key, train_key = jax.random.split(key)
                 train_state, update_metrics = jax.lax.scan(
                     f=lambda ts, k_: run_epoch_separate(
@@ -2223,6 +2417,8 @@ def train(args: Args):
                     xs=jax.random.split(train_key, args.num_epochs),
                 )
         else:
+            # No HER: flatten the S x E batch and run num_epochs of joint
+            # critic + actor SGD on the original trajectory alone.
             batch.extras["weight"] = batch.valid_mask.astype(jnp.float32)
             batch = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
@@ -2240,6 +2436,7 @@ def train(args: Args):
 
     # --- train_step + training_epoch -------------------------------------
     def train_step(state: ReppoTrainingState, key):
+        """One iteration = 1 rollout (num_steps env steps) + 1 learner_fn call."""
         key, rollout_key, learn_key = jax.random.split(key, 3)
         transitions, state = collect_rollout(key=rollout_key, train_state=state)
 
@@ -2262,12 +2459,14 @@ def train(args: Args):
 
     @jax.jit
     def training_epoch(train_state, keys):
+        """Scan train_step for eval_interval iterations under a single jit."""
         train_state, metrics = jax.lax.scan(train_step, train_state, keys)
         metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics)
         return train_state, metrics
 
     # --- Eval wiring (CrlEvaluator) --------------------------------------
     def deterministic_actor_step(training_state: ReppoTrainingState, env_, env_state, extra_fields=()):
+        """Evaluator step: pick the tanh-squashed mean action (no sampling)."""
         obs = normalizer.normalize(training_state.normalization_state, env_state.obs)
         actions = actor.apply(
             training_state.actor_state.params, obs, deterministic=True
@@ -2288,6 +2487,7 @@ def train(args: Args):
     save_dir.mkdir(parents=True, exist_ok=True)
 
     def checkpoint(train_state: ReppoTrainingState, tag: str):
+        """Pickle actor/critic/target/normalizer params to save_dir/step_<tag>.pkl."""
         if not args.checkpoint:
             return
         params = (
@@ -2301,6 +2501,7 @@ def train(args: Args):
 
     # --- capture_vis -----------------------------------------------------
     def capture_vis_to_wandb(train_state: ReppoTrainingState, step: int):
+        """Roll out num_render deterministic episodes and log Brax HTML viz to W&B."""
         if not args.capture_vis:
             return
         print(f"Capturing vis at step {step}...", flush=True)
@@ -2390,7 +2591,7 @@ def train(args: Args):
         current_step = valid_step_count if args.stagger_envs else env_step_count
         log_metrics(current_step, eval_epoch, metrics)
 
-        # Checkpoint cadence: first 5, last 5, every 10th (mirrors crl-reppo)
+        # Checkpoint cadence: first 5 eval epochs, last 5, and every 10th.
         should_checkpoint = (
             eval_epoch < 5
             or eval_epoch >= num_evals - 5
@@ -2423,6 +2624,8 @@ def train(args: Args):
 def main():
     args = tyro.cli(Args)
 
+    # Build a compact run_name that summarizes the HER flags, target type,
+    # k (number of hindsight goals per step), and actor depth.
     name_parts = []
     if args.use_her_critic:
         name_parts.append("c")
