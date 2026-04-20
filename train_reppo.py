@@ -1,8 +1,8 @@
 """
 Section order (top-to-bottom):
   imports -> Args -> Normalizer -> AutoResetWrapper/wrap_for_training -> hl_gauss
-  -> prefix_dict/log_metrics -> networks (residual_block, SA_encoder, G_encoder,
-  Actor, Critic, action_dist) -> make_env -> Transition/RolloutTransition -> HER
+  -> prefix_dict/log_metrics -> networks (residual_block, Actor, Critic,
+  action_dist) -> make_env -> Transition/RolloutTransition -> HER
   helpers -> TD-lambda helpers -> stagger helpers -> losses/epoch runners ->
   ReppoTrainingState -> init_train_state -> collect_rollout / train_step /
   training_epoch -> eval wiring -> checkpointing -> capture_vis -> main.
@@ -121,8 +121,8 @@ class Args:
     # --- Networks (depth-scaling axis follows scaling-crl) ---
     actor_network_width: int = 256
     actor_depth: int = 32
-    critic_network_width: int = 256      # also controls G_encoder width
-    critic_depth: int = 32                # also controls G_encoder depth
+    critic_network_width: int = 256
+    critic_depth: int = 32
     actor_skip_connections: int = 0      # reserved
     critic_skip_connections: int = 0     # reserved
     use_relu: int = 0                    # 0 => swish, 1 => relu (matches scaling-crl)
@@ -526,22 +526,19 @@ def log_metrics(time_steps: int, eval_epoch: int, metrics: dict):
 # =============================================================================
 # Networks
 #
-# The residual-block stack (residual_block, SA_encoder, G_encoder) and the
-# Actor residual tower are copied from scaling-crl so this experiment shares
-# the same depth-scaling axis as the CRL paper for a fair comparison. The
-# Critic's post-encoder fusion head (HL-Gauss categorical return logits +
-# auxiliary next-embedding / next-reward head) is implemented here.
+# The residual-block stack (residual_block) and the Actor residual tower are
+# copied from scaling-crl so this experiment shares the same depth-scaling
+# axis as the CRL paper for a fair comparison. The Critic uses a single
+# residual trunk over concat(state, goal, action) and emits HL-Gauss
+# categorical return logits plus auxiliary next-embedding / next-reward
+# predictions.
 #
 #   residual_block : Dense -> Norm -> Act, four times, with an identity
 #                    shortcut added at the end.
-#   SA_encoder     : concatenates (state, action), runs a Dense+Norm+Act
-#                    stem, then (network_depth // 4) residual blocks of
-#                    width network_width. Output: (B, network_width).
-#   G_encoder      : same as SA_encoder but on the goal slice only.
-#   Critic         : fuses SA and G encodings (concat -> Dense+Norm+Act)
-#                    and emits HL-Gauss categorical logits over return bins,
-#                    plus auxiliary predictions of the next embedding and
-#                    the next reward.
+#   Critic         : single residual trunk on concat(obs, action); a
+#                    Dense+Norm+Act projection feeds HL-Gauss categorical
+#                    logits over return bins, plus auxiliary predictions of
+#                    the next embedding and the next reward.
 #   Actor          : Dense stem + residual blocks, two Dense heads for the
 #                    mean and log_std of a tanh-squashed diagonal Gaussian.
 #                    Also carries two scalar log-parameters:
@@ -571,68 +568,6 @@ def residual_block(x, width, normalize, activation):
     x = activation(x)
     x = x + identity
     return x
-
-
-class SA_encoder(nn.Module):
-    norm_type = "layer_norm"
-    network_width: int = 1024
-    network_depth: int = 4
-    skip_connections: int = 0
-    use_relu: int = 0
-
-    @nn.compact
-    def __call__(self, s: jnp.ndarray, a: jnp.ndarray):
-        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
-        bias_init = nn.initializers.zeros
-
-        if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
-        else:
-            normalize = lambda x: x
-
-        if self.use_relu:
-            activation = nn.relu
-        else:
-            activation = nn.swish
-
-        x = jnp.concatenate([s, a], axis=-1)
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
-        for i in range(self.network_depth // 4):
-            x = residual_block(x, self.network_width, normalize, activation)
-        return x
-
-
-class G_encoder(nn.Module):
-    norm_type = "layer_norm"
-    network_width: int = 1024
-    network_depth: int = 4
-    skip_connections: int = 0
-    use_relu: int = 0
-
-    @nn.compact
-    def __call__(self, g: jnp.ndarray):
-        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
-        bias_init = nn.initializers.zeros
-
-        if self.norm_type == "layer_norm":
-            normalize = lambda x: nn.LayerNorm()(x)
-        else:
-            normalize = lambda x: x
-
-        if self.use_relu:
-            activation = nn.relu
-        else:
-            activation = nn.swish
-
-        x = g
-        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-        x = normalize(x)
-        x = activation(x)
-        for i in range(self.network_depth // 4):
-            x = residual_block(x, self.network_width, normalize, activation)
-        return x
 
 
 class Actor(nn.Module):
@@ -699,23 +634,21 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """Q(state, action, goal) with an HL-Gauss categorical return head.
 
-    Two towers: SA_encoder encodes (state, action) and G_encoder encodes the
-    goal slice. Their outputs are concatenated and passed through a
-    Dense+Norm+Act fusion layer, which feeds:
+    Single residual trunk on concat(obs, action) = concat(state, goal, action).
+    The trunk output feeds a Dense+Norm+Act projection, which in turn feeds:
 
       value          : expected return under softmax(logits) over the
                        HL-Gauss bin support
       logits         : raw categorical logits (num_bins)
       probs          : softmax(logits)
-      embed          : fused (SA, G) representation, also used as an
-                       auxiliary self-supervised target
-      pred_features  : auxiliary prediction of the next-step fused embed
+      embed          : trunk representation, also used as an auxiliary
+                       self-supervised target
+      pred_features  : auxiliary prediction of the next-step trunk embed
                        (trained by MSE against a stop-grad target)
       pred_rew       : auxiliary scalar reward prediction
     """
 
     action_size: int
-    obs_dim: int
     network_width: int = 256
     network_depth: int = 4
     skip_connections: int = 0
@@ -726,34 +659,22 @@ class Critic(nn.Module):
 
     @nn.compact
     def __call__(self, obs, action):
-        # The observation carries the goal spliced into its trailing slots;
-        # split it into the state slice and the goal slice.
-        state = obs[..., : self.obs_dim]
-        goal = obs[..., self.obs_dim :]
-
-        # Two independent residual towers: one for (state, action), one for
-        # the goal. Output width matches network_width.
-        sa = SA_encoder(
-            network_width=self.network_width,
-            network_depth=self.network_depth,
-            skip_connections=self.skip_connections,
-            use_relu=self.use_relu,
-        )(state, action)
-        g = G_encoder(
-            network_width=self.network_width,
-            network_depth=self.network_depth,
-            skip_connections=self.skip_connections,
-            use_relu=self.use_relu,
-        )(goal)
-
-        # Fuse the two encodings by concatenation: (B, 2 * network_width).
-        fusion = jnp.concatenate([sa, g], axis=-1)
-        fusion_dim = 2 * self.network_width
-
         normalize = lambda y: nn.LayerNorm()(y)
         activation = nn.relu if self.use_relu else nn.swish
 
-        # Fusion head: Dense -> Norm -> Act -> Dense to num_bins logits.
+        # Single residual trunk on concat(state, goal, action). The observation
+        # already carries the goal spliced into its trailing slots, so
+        # concat(obs, action) == concat(state, goal, action).
+        x = jnp.concatenate([obs, action], axis=-1)
+        x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
+        x = normalize(x)
+        x = activation(x)
+        for _ in range(self.network_depth // 4):
+            x = residual_block(x, self.network_width, normalize, activation)
+        fusion = x
+        fusion_dim = self.network_width
+
+        # Projection head: Dense -> Norm -> Act -> Dense to num_bins logits.
         q = nn.Dense(fusion_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(fusion)
         q = normalize(q)
         q = activation(q)
@@ -1132,7 +1053,7 @@ def make_td_lambda_helpers(
     goal_indices,
     goal_reach_thresh: float,
     replace_goal_in_obs,
-    fusion_dim: int = 512,
+    fusion_dim: int = 256,
 ):
     """Factory returning (nstep_lambda, compute_extras, compute_extras_alt,
     compute_alt_td_lambda_targets_k)."""
@@ -2067,7 +1988,6 @@ def train(args: Args):
     )
     critic = Critic(
         action_size=action_size,
-        obs_dim=args.obs_dim,
         network_width=args.critic_network_width,
         network_depth=args.critic_depth,
         skip_connections=args.critic_skip_connections,
@@ -2119,7 +2039,7 @@ def train(args: Args):
         goal_indices,
         goal_reach_thresh,
         replace_goal_in_obs,
-        fusion_dim=2 * args.critic_network_width,
+        fusion_dim=args.critic_network_width,
     )
     (
         select_active_envs,
