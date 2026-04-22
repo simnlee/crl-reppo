@@ -1121,8 +1121,11 @@ def make_td_lambda_helpers(
         )
         true_next_action = jnp.clip(true_next_action, -0.999, 0.999)
         true_next_log_prob = next_pi.log_prob(true_next_action)
-        # Max-entropy soft reward: r_t - gamma * alpha * log pi(a_{t+1}).
-        soft_reward = batch.reward - args.gamma * true_next_log_prob * alpha
+        # Max-entropy soft reward: r_t - gamma * (1 - done) * alpha * log pi(a_{t+1}).
+        # The (1 - done) mask drops the entropy correction at true terminations
+        # where no real "next" transition exists; matches the standard SAC
+        # V_soft Bellman form once the V-bootstrap's (1 - done) is distributed.
+        soft_reward = batch.reward - args.gamma * (1.0 - batch.done) * true_next_log_prob * alpha
 
         # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
         # estimated with num_action_samples draws to reduce variance.
@@ -1146,7 +1149,7 @@ def make_td_lambda_helpers(
             "next_emb": jax.lax.stop_gradient(next_emb),
         }
 
-    def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt):
+    def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt, done_alt):
         """Soft reward and V(next) for a hindsight trajectory under g_alt.
 
         The rollout action at t+1 was executed under the original goal, not
@@ -1165,7 +1168,8 @@ def make_td_lambda_helpers(
         next_action = jnp.clip(next_action, -0.999, 0.999)
         next_log_prob = next_pi.log_prob(next_action)
         # Max-entropy soft reward using the fresh action's log-prob.
-        soft_reward = reward_alt - args.gamma * next_log_prob * alpha
+        # (1 - done_alt) drops the entropy correction at true terminations.
+        soft_reward = reward_alt - args.gamma * (1.0 - done_alt) * next_log_prob * alpha
 
         # V(next) averaged over num_action_samples draws from pi(.|x, g_alt).
         key, next_act_key = jax.random.split(key)
@@ -1274,17 +1278,23 @@ def make_td_lambda_helpers(
             log_rho = is_num_log - is_denom[None, :]
             rho = jnp.minimum(1.0, jnp.exp(log_rho))
 
+            # Terminal flags for step u (needed to mask the entropy correction
+            # at true terminations, where no "next" transition exists).
+            term_u = batch_raw.done[u]
+            trunc_u = batch_raw.truncated[u]
+            term_mask = 1.0 - term_u[None, :]
+
             if args.sample_new_action_for_tdL:
                 # Use the fresh-action log-prob for both boundary and interior.
-                soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
+                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
                 soft_r_int = soft_r_bnd
             else:
                 # Boundary: fresh-action log-prob. Interior: per-decision IS
                 # estimator of -H[pi_{theta'}(.|x_{u+1}, g_alt)] applied to
                 # Lemma 1 with f(a) = log pi_{theta'}(a | x_{u+1}, g_alt), i.e.
                 # rho * log pi_{theta'}(a_obs | x_{u+1}, g_alt) = rho * is_num_log.
-                soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
-                soft_r_int = reward_u - args.gamma * alpha * rho * is_num_log
+                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
+                soft_r_int = reward_u - args.gamma * alpha * term_mask * rho * is_num_log
 
             # For each t, u is the segment boundary if u == end_idx[t, e],
             # and is an interior step if t <= u < end_idx[t, e].
@@ -1299,9 +1309,6 @@ def make_td_lambda_helpers(
             # Track the mean clipped IS ratio over interior ticks (logged).
             rho_sum = rho_sum + jnp.sum(rho * is_interior * valid_f)
             rho_count = rho_count + jnp.sum(is_interior * valid_f)
-
-            term_u = batch_raw.done[u]
-            trunc_u = batch_raw.truncated[u]
 
             # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
             G_bnd = soft_r_bnd + args.gamma * jnp.where(
@@ -1691,8 +1698,8 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
           * kl * stopgrad(lagrangian)  (KL branch, active when the estimated
               KL(old_pi || pi) >= kl_bound): pulls pi back toward the frozen
               behavior policy.
-          * target_entropy_loss = temperature * stopgrad(entropy_target
-              + entropy): grows alpha when entropy drops below target.
+          * target_entropy_loss = temperature * stopgrad(entropy
+              - entropy_target): grows alpha when entropy drops below target.
           * lagrangian_loss    = -lagrangian * stopgrad(kl - kl_bound):
               grows beta when the estimated KL exceeds kl_bound.
         """
@@ -1715,7 +1722,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         )
         critic_pred = critic.apply(critic_params, minibatch.obs, pred_action)
         value = critic_pred["value"]
-        # Q-branch loss: alpha * log pi(a') - Q(x, a').
+        # Q-branch loss: - Q(x, a') + alpha * log pi(a')
         per_actor_loss = log_prob * alpha - value
         entropy = -log_prob
         action_size_target = action_size * args.ent_target_mult
@@ -1731,7 +1738,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         loss = jnp.sum(w * per_sample_loss) / w_sum
 
         # Entropy-temperature update: alpha grows when entropy drops below target.
-        target_entropy = action_size_target + entropy
+        target_entropy = entropy - action_size_target
         temperature = jnp.exp(params["params"]["log_temperature"])
         target_entropy_loss = temperature * jax.lax.stop_gradient(target_entropy)
 
@@ -2289,6 +2296,7 @@ def train(args: Args):
                         obs_alt=obs_k,
                         next_obs_alt=next_obs_k,
                         reward_alt=reward_k,
+                        done_alt=done_k,
                     )
                     tv_k = td0_targets(
                         extras_k["soft_reward"], extras_k["next_value"], done_k
@@ -2459,6 +2467,7 @@ def train(args: Args):
                         obs_alt=obs_k,
                         next_obs_alt=next_obs_k,
                         reward_alt=reward_k,
+                        done_alt=done_k,
                     )
                     tv_k = td0_targets(
                         extras_k["soft_reward"], extras_k["next_value"], done_k
