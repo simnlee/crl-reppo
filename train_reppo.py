@@ -1016,6 +1016,12 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
 
     def td0_targets(soft_reward, next_value, done):
         """One-step TD(0) target: r_tilde + gamma * (1 - done) * V(next)."""
+        # TODO: if use_her_td_lambda=False is ever used, the gate here and the
+        # entropy mask in compute_extras_alt (L1172) both need to become
+        # (1 - done * (1 - truncated)) to correctly bootstrap at brax time-limits
+        # and include the entropy correction there. Both would need truncated_alt
+        # threaded through compute_extras_alt's signature. Currently unreachable
+        # under the slurm config (use_her_td_lambda=True) so deferred.
         return soft_reward + args.gamma * (1.0 - done) * next_value
 
     return replace_goal_in_obs, compute_goal_reward, her_augment, td0_targets
@@ -1121,11 +1127,13 @@ def make_td_lambda_helpers(
         )
         true_next_action = jnp.clip(true_next_action, -0.999, 0.999)
         true_next_log_prob = next_pi.log_prob(true_next_action)
-        # Max-entropy soft reward: r_t - gamma * (1 - done) * alpha * log pi(a_{t+1}).
-        # The (1 - done) mask drops the entropy correction at true terminations
-        # where no real "next" transition exists; matches the standard SAC
-        # V_soft Bellman form once the V-bootstrap's (1 - done) is distributed.
-        soft_reward = batch.reward - args.gamma * (1.0 - batch.done) * true_next_log_prob * alpha
+        # Max-entropy soft reward: r_t - gamma * (1 - intrinsic_done) * alpha * log pi(a_{t+1}).
+        # Under brax's EpisodeWrapper convention, done=1 fires at BOTH intrinsic
+        # terminations and time-limits; truncated=1 disambiguates the time-limit
+        # case. The "truly absorbing state" flag is thus done * (1 - truncated).
+        # Matches the nstep_lambda bootstrap gate `jnp.where(truncated, V, (1-done)*V)`.
+        intrinsic_done = batch.done * (1.0 - batch.truncated)
+        soft_reward = batch.reward - args.gamma * (1.0 - intrinsic_done) * true_next_log_prob * alpha
 
         # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
         # estimated with num_action_samples draws to reduce variance.
@@ -1168,7 +1176,8 @@ def make_td_lambda_helpers(
         next_action = jnp.clip(next_action, -0.999, 0.999)
         next_log_prob = next_pi.log_prob(next_action)
         # Max-entropy soft reward using the fresh action's log-prob.
-        # (1 - done_alt) drops the entropy correction at true terminations.
+        # Gated by (1 - done_alt) to match td0_targets (which also uses just
+        # (1 - done) on the bootstrap). See td0_targets TODO re: brax time-limits.
         soft_reward = reward_alt - args.gamma * (1.0 - done_alt) * next_log_prob * alpha
 
         # V(next) averaged over num_action_samples draws from pi(.|x, g_alt).
@@ -1278,11 +1287,14 @@ def make_td_lambda_helpers(
             log_rho = is_num_log - is_denom[None, :]
             rho = jnp.minimum(1.0, jnp.exp(log_rho))
 
-            # Terminal flags for step u (needed to mask the entropy correction
-            # at true terminations, where no "next" transition exists).
+            # Terminal flags for step u. Under brax's EpisodeWrapper, done=1
+            # fires at both intrinsic terminations and time-limits; truncated=1
+            # disambiguates the time-limit case. term_mask zeros the entropy
+            # correction ONLY at intrinsic terminations (done=1, truncated=0),
+            # matching the jnp.where(trunc, V, (1-term)*V) bootstrap gate below.
             term_u = batch_raw.done[u]
             trunc_u = batch_raw.truncated[u]
-            term_mask = 1.0 - term_u[None, :]
+            term_mask = 1.0 - term_u[None, :] * (1.0 - trunc_u[None, :])
 
             if args.sample_new_action_for_tdL:
                 # Use the fresh-action log-prob for both boundary and interior.
