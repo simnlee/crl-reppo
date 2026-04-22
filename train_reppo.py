@@ -1125,7 +1125,7 @@ def make_td_lambda_helpers(
             next_action,
             jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
         )
-        true_next_action = jnp.clip(true_next_action, -0.999, 0.999)
+        true_next_action = jnp.clip(true_next_action, -1 + 1e-4, 1 - 1e-4)
         true_next_log_prob = next_pi.log_prob(true_next_action)
         # Max-entropy soft reward: r_t - gamma * (1 - intrinsic_done) * alpha * log pi(a_{t+1}).
         # Under brax's EpisodeWrapper convention, done=1 fires at BOTH intrinsic
@@ -1173,7 +1173,7 @@ def make_td_lambda_helpers(
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, next_obs_alt)
         next_action = next_pi.sample(seed=next_act_key)
-        next_action = jnp.clip(next_action, -0.999, 0.999)
+        next_action = jnp.clip(next_action, -1 + 1e-4, 1 - 1e-4)
         next_log_prob = next_pi.log_prob(next_action)
         # Max-entropy soft reward using the fresh action's log-prob.
         # Gated by (1 - done_alt) to match td0_targets (which also uses just
@@ -1256,7 +1256,7 @@ def make_td_lambda_helpers(
             # for the boundary max-entropy correction.
             pi_alt = _actor_dist(actor_params, obs_alt_u)
             fresh_action = pi_alt.sample(seed=act_key)
-            fresh_action = jnp.clip(fresh_action, -0.999, 0.999)
+            fresh_action = jnp.clip(fresh_action, -1 + 1e-4, 1 - 1e-4)
             fresh_log_prob = pi_alt.log_prob(fresh_action)
 
             # Rolled-out action at step u+1 (clamped to the open interval to
@@ -1595,7 +1595,7 @@ def make_stagger_helpers(args: "Args", env):
                 minval=-1.0,
                 maxval=1.0,
             )
-            action = jnp.clip(action, -0.999, 0.999)
+            action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_state = env.step(state, action)
             active = step_idx < offset_steps
             done_mask = jnp.asarray(next_state.done > 0, dtype=jnp.bool_)
@@ -1690,15 +1690,21 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
 
     def compute_policy_kl(minibatch, pi, old_pi):
         """Sample-based KL(old_pi || pi) estimator using 4 action samples."""
-        # Draw 4 actions under old_pi; clamp them to the valid tanh range.
-        old_pi_action, old_pi_act_log_prob = old_pi.sample_and_log_prob(
+        # Draw 4 actions under old_pi; clamp them to the valid tanh range so
+        # pi.log_prob's internal atanh is numerically well-defined.
+        old_pi_action, _ = old_pi.sample_and_log_prob(
             sample_shape=(4,), seed=minibatch.extras["kl_key"]
         )
         old_pi_action = jnp.clip(old_pi_action, -1 + 1e-4, 1 - 1e-4)
-        # KL(old || pi) ~ mean_a[ log old_pi(a) - log pi(a) ], a ~ old_pi.
-        old_pi_act_log_prob = old_pi_act_log_prob.mean(0)
-        pi_act_log_prob = pi.log_prob(old_pi_action).mean(0)
-        kl = old_pi_act_log_prob - pi_act_log_prob
+        # Evaluate BOTH log-probs at the same clipped action so the per-sample
+        # log-ratio is symmetric. This is a deliberate deviation from
+        # reppo_maniskill.py (which uses old_pi's pre-clip log_prob paired with
+        # pi's post-clip log_prob); the asymmetric pattern is a numerical
+        # artifact, not a paper prescription, and biases the KL estimator when
+        # the policy saturates against the tanh boundary.
+        old_pi_log_prob = old_pi.log_prob(old_pi_action).mean(0)
+        pi_log_prob = pi.log_prob(old_pi_action).mean(0)
+        kl = old_pi_log_prob - pi_log_prob
         return kl
 
     def actor_loss(params, train_state, minibatch):
@@ -2142,7 +2148,7 @@ def train(args: Args):
             key, act_key = jax.random.split(key)
             action = policy(act_key, env_state.obs, train_state)
             # Clip strictly inside the tanh range for a finite log-prob.
-            action = jnp.clip(action, -0.999, 0.999)
+            action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_env_state = env.step(env_state, action)
             # valid_mask is only meaningful under staggered resets; it is
             # all-True under AutoResetWrapper (the default).
@@ -2615,7 +2621,7 @@ def train(args: Args):
         actions = actor.apply(
             training_state.actor_state.params, obs, deterministic=True
         )
-        actions = jnp.clip(actions, -0.999, 0.999)
+        actions = jnp.clip(actions, -1 + 1e-4, 1 - 1e-4)
         nstate = env_.step(env_state, actions)
         state_extras = {x: nstate.info[x] for x in extra_fields}
         return nstate, Transition(
@@ -2660,7 +2666,7 @@ def train(args: Args):
         def policy_step_vis(env_state, norm_state, actor_params):
             obs = normalizer.normalize(norm_state, env_state.obs)
             actions = actor.apply(actor_params, obs, deterministic=True)
-            actions = jnp.clip(actions, -0.999, 0.999)
+            actions = jnp.clip(actions, -1 + 1e-4, 1 - 1e-4)
             next_state = vis_env.step(env_state, actions)
             return next_state, env_state
 
