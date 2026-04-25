@@ -1016,6 +1016,12 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
 
     def td0_targets(soft_reward, next_value, done):
         """One-step TD(0) target: r_tilde + gamma * (1 - done) * V(next)."""
+        # TODO: if use_her_td_lambda=False is ever used, the gate here and the
+        # entropy mask in compute_extras_alt (L1172) both need to become
+        # (1 - done * (1 - truncated)) to correctly bootstrap at brax time-limits
+        # and include the entropy correction there. Both would need truncated_alt
+        # threaded through compute_extras_alt's signature. Currently unreachable
+        # under the slurm config (use_her_td_lambda=True) so deferred.
         return soft_reward + args.gamma * (1.0 - done) * next_value
 
     return replace_goal_in_obs, compute_goal_reward, her_augment, td0_targets
@@ -1119,10 +1125,15 @@ def make_td_lambda_helpers(
             next_action,
             jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
         )
-        true_next_action = jnp.clip(true_next_action, -0.999, 0.999)
+        true_next_action = jnp.clip(true_next_action, -1 + 1e-4, 1 - 1e-4)
         true_next_log_prob = next_pi.log_prob(true_next_action)
-        # Max-entropy soft reward: r_t - gamma * alpha * log pi(a_{t+1}).
-        soft_reward = batch.reward - args.gamma * true_next_log_prob * alpha
+        # Max-entropy soft reward: r_t - gamma * (1 - intrinsic_done) * alpha * log pi(a_{t+1}).
+        # Under brax's EpisodeWrapper convention, done=1 fires at BOTH intrinsic
+        # terminations and time-limits; truncated=1 disambiguates the time-limit
+        # case. The "truly absorbing state" flag is thus done * (1 - truncated).
+        # Matches the nstep_lambda bootstrap gate `jnp.where(truncated, V, (1-done)*V)`.
+        intrinsic_done = batch.done * (1.0 - batch.truncated)
+        soft_reward = batch.reward - args.gamma * (1.0 - intrinsic_done) * true_next_log_prob * alpha
 
         # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
         # estimated with num_action_samples draws to reduce variance.
@@ -1146,7 +1157,7 @@ def make_td_lambda_helpers(
             "next_emb": jax.lax.stop_gradient(next_emb),
         }
 
-    def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt):
+    def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt, done_alt):
         """Soft reward and V(next) for a hindsight trajectory under g_alt.
 
         The rollout action at t+1 was executed under the original goal, not
@@ -1162,10 +1173,12 @@ def make_td_lambda_helpers(
         key, next_act_key = jax.random.split(key)
         next_pi = _actor_dist(actor_params, next_obs_alt)
         next_action = next_pi.sample(seed=next_act_key)
-        next_action = jnp.clip(next_action, -0.999, 0.999)
+        next_action = jnp.clip(next_action, -1 + 1e-4, 1 - 1e-4)
         next_log_prob = next_pi.log_prob(next_action)
         # Max-entropy soft reward using the fresh action's log-prob.
-        soft_reward = reward_alt - args.gamma * next_log_prob * alpha
+        # Gated by (1 - done_alt) to match td0_targets (which also uses just
+        # (1 - done) on the bootstrap). See td0_targets TODO re: brax time-limits.
+        soft_reward = reward_alt - args.gamma * (1.0 - done_alt) * next_log_prob * alpha
 
         # V(next) averaged over num_action_samples draws from pi(.|x, g_alt).
         key, next_act_key = jax.random.split(key)
@@ -1243,7 +1256,7 @@ def make_td_lambda_helpers(
             # for the boundary max-entropy correction.
             pi_alt = _actor_dist(actor_params, obs_alt_u)
             fresh_action = pi_alt.sample(seed=act_key)
-            fresh_action = jnp.clip(fresh_action, -0.999, 0.999)
+            fresh_action = jnp.clip(fresh_action, -1 + 1e-4, 1 - 1e-4)
             fresh_log_prob = pi_alt.log_prob(fresh_action)
 
             # Rolled-out action at step u+1 (clamped to the open interval to
@@ -1274,17 +1287,26 @@ def make_td_lambda_helpers(
             log_rho = is_num_log - is_denom[None, :]
             rho = jnp.minimum(1.0, jnp.exp(log_rho))
 
+            # Terminal flags for step u. Under brax's EpisodeWrapper, done=1
+            # fires at both intrinsic terminations and time-limits; truncated=1
+            # disambiguates the time-limit case. term_mask zeros the entropy
+            # correction ONLY at intrinsic terminations (done=1, truncated=0),
+            # matching the jnp.where(trunc, V, (1-term)*V) bootstrap gate below.
+            term_u = batch_raw.done[u]
+            trunc_u = batch_raw.truncated[u]
+            term_mask = 1.0 - term_u[None, :] * (1.0 - trunc_u[None, :])
+
             if args.sample_new_action_for_tdL:
                 # Use the fresh-action log-prob for both boundary and interior.
-                soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
+                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
                 soft_r_int = soft_r_bnd
             else:
                 # Boundary: fresh-action log-prob. Interior: per-decision IS
                 # estimator of -H[pi_{theta'}(.|x_{u+1}, g_alt)] applied to
                 # Lemma 1 with f(a) = log pi_{theta'}(a | x_{u+1}, g_alt), i.e.
                 # rho * log pi_{theta'}(a_obs | x_{u+1}, g_alt) = rho * is_num_log.
-                soft_r_bnd = reward_u - args.gamma * alpha * fresh_log_prob
-                soft_r_int = reward_u - args.gamma * alpha * rho * is_num_log
+                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
+                soft_r_int = reward_u - args.gamma * alpha * term_mask * rho * is_num_log
 
             # For each t, u is the segment boundary if u == end_idx[t, e],
             # and is an interior step if t <= u < end_idx[t, e].
@@ -1299,9 +1321,6 @@ def make_td_lambda_helpers(
             # Track the mean clipped IS ratio over interior ticks (logged).
             rho_sum = rho_sum + jnp.sum(rho * is_interior * valid_f)
             rho_count = rho_count + jnp.sum(is_interior * valid_f)
-
-            term_u = batch_raw.done[u]
-            trunc_u = batch_raw.truncated[u]
 
             # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
             G_bnd = soft_r_bnd + args.gamma * jnp.where(
@@ -1576,7 +1595,7 @@ def make_stagger_helpers(args: "Args", env):
                 minval=-1.0,
                 maxval=1.0,
             )
-            action = jnp.clip(action, -0.999, 0.999)
+            action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_state = env.step(state, action)
             active = step_idx < offset_steps
             done_mask = jnp.asarray(next_state.done > 0, dtype=jnp.bool_)
@@ -1671,15 +1690,21 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
 
     def compute_policy_kl(minibatch, pi, old_pi):
         """Sample-based KL(old_pi || pi) estimator using 4 action samples."""
-        # Draw 4 actions under old_pi; clamp them to the valid tanh range.
-        old_pi_action, old_pi_act_log_prob = old_pi.sample_and_log_prob(
+        # Draw 4 actions under old_pi; clamp them to the valid tanh range so
+        # pi.log_prob's internal atanh is numerically well-defined.
+        old_pi_action, _ = old_pi.sample_and_log_prob(
             sample_shape=(4,), seed=minibatch.extras["kl_key"]
         )
         old_pi_action = jnp.clip(old_pi_action, -1 + 1e-4, 1 - 1e-4)
-        # KL(old || pi) ~ mean_a[ log old_pi(a) - log pi(a) ], a ~ old_pi.
-        old_pi_act_log_prob = old_pi_act_log_prob.mean(0)
-        pi_act_log_prob = pi.log_prob(old_pi_action).mean(0)
-        kl = old_pi_act_log_prob - pi_act_log_prob
+        # Evaluate BOTH log-probs at the same clipped action so the per-sample
+        # log-ratio is symmetric. This is a deliberate deviation from
+        # reppo_maniskill.py (which uses old_pi's pre-clip log_prob paired with
+        # pi's post-clip log_prob); the asymmetric pattern is a numerical
+        # artifact, not a paper prescription, and biases the KL estimator when
+        # the policy saturates against the tanh boundary.
+        old_pi_log_prob = old_pi.log_prob(old_pi_action).mean(0)
+        pi_log_prob = pi.log_prob(old_pi_action).mean(0)
+        kl = old_pi_log_prob - pi_log_prob
         return kl
 
     def actor_loss(params, train_state, minibatch):
@@ -1691,8 +1716,8 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
           * kl * stopgrad(lagrangian)  (KL branch, active when the estimated
               KL(old_pi || pi) >= kl_bound): pulls pi back toward the frozen
               behavior policy.
-          * target_entropy_loss = temperature * stopgrad(entropy_target
-              + entropy): grows alpha when entropy drops below target.
+          * target_entropy_loss = temperature * stopgrad(entropy
+              - entropy_target): grows alpha when entropy drops below target.
           * lagrangian_loss    = -lagrangian * stopgrad(kl - kl_bound):
               grows beta when the estimated KL exceeds kl_bound.
         """
@@ -1715,7 +1740,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         )
         critic_pred = critic.apply(critic_params, minibatch.obs, pred_action)
         value = critic_pred["value"]
-        # Q-branch loss: alpha * log pi(a') - Q(x, a').
+        # Q-branch loss: - Q(x, a') + alpha * log pi(a')
         per_actor_loss = log_prob * alpha - value
         entropy = -log_prob
         action_size_target = action_size * args.ent_target_mult
@@ -1731,7 +1756,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         loss = jnp.sum(w * per_sample_loss) / w_sum
 
         # Entropy-temperature update: alpha grows when entropy drops below target.
-        target_entropy = action_size_target + entropy
+        target_entropy = entropy - action_size_target
         temperature = jnp.exp(params["params"]["log_temperature"])
         target_entropy_loss = temperature * jax.lax.stop_gradient(target_entropy)
 
@@ -2123,7 +2148,7 @@ def train(args: Args):
             key, act_key = jax.random.split(key)
             action = policy(act_key, env_state.obs, train_state)
             # Clip strictly inside the tanh range for a finite log-prob.
-            action = jnp.clip(action, -0.999, 0.999)
+            action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_env_state = env.step(env_state, action)
             # valid_mask is only meaningful under staggered resets; it is
             # all-True under AutoResetWrapper (the default).
@@ -2289,6 +2314,7 @@ def train(args: Args):
                         obs_alt=obs_k,
                         next_obs_alt=next_obs_k,
                         reward_alt=reward_k,
+                        done_alt=done_k,
                     )
                     tv_k = td0_targets(
                         extras_k["soft_reward"], extras_k["next_value"], done_k
@@ -2459,6 +2485,7 @@ def train(args: Args):
                         obs_alt=obs_k,
                         next_obs_alt=next_obs_k,
                         reward_alt=reward_k,
+                        done_alt=done_k,
                     )
                     tv_k = td0_targets(
                         extras_k["soft_reward"], extras_k["next_value"], done_k
@@ -2594,7 +2621,7 @@ def train(args: Args):
         actions = actor.apply(
             training_state.actor_state.params, obs, deterministic=True
         )
-        actions = jnp.clip(actions, -0.999, 0.999)
+        actions = jnp.clip(actions, -1 + 1e-4, 1 - 1e-4)
         nstate = env_.step(env_state, actions)
         state_extras = {x: nstate.info[x] for x in extra_fields}
         return nstate, Transition(
@@ -2639,7 +2666,7 @@ def train(args: Args):
         def policy_step_vis(env_state, norm_state, actor_params):
             obs = normalizer.normalize(norm_state, env_state.obs)
             actions = actor.apply(actor_params, obs, deterministic=True)
-            actions = jnp.clip(actions, -0.999, 0.999)
+            actions = jnp.clip(actions, -1 + 1e-4, 1 - 1e-4)
             next_state = vis_env.step(env_state, actions)
             return next_state, env_state
 

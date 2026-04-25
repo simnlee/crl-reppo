@@ -5,7 +5,7 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=16
 #SBATCH --mem=60G
-#SBATCH --time=0-8:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --requeue
 #SBATCH --array=0-34
 
@@ -44,6 +44,7 @@ SEED=${SEEDS[$SEED_IDX]}
 HER_CRITIC=true
 HER_ACTOR=true
 HER_TD_LAMBDA=true
+HER_PER_EPOCH=true
 
 # Non-variation flags (mirror train_reppo.sh so the two sweeps are comparable)
 HER_K=1
@@ -57,11 +58,11 @@ SAMPLE_NEW_ACTION_FOR_TDL=true
 # DATETIME="${DATETIME:-$(date +%Y%m%d_%H%M)}"
 
 # W&B group-name scheme mirrors train_reppo.sh, with an env_sweep suffix
-GROUP="baseline_k${HER_K}"
+GROUP="k${HER_K}"
 [[ "$STAGGER_ENVS" == "true" ]]              && GROUP+="_stagger_envs"
 [[ "$NORMALIZE_HINDSIGHT_LOSS" == "true" ]]   && GROUP+="_normalize_hindsight_loss"
 [[ "$SAMPLE_NEW_ACTION_FOR_TDL" == "true" ]]  && GROUP+="_sample_new_action_for_tdL"
-GROUP+="_v5_1000_rollout"
+GROUP+="_v7_r1000_herresample_tempsigns"
 
 # W&B logging (overridable via --export)
 WANDB_PROJECT="${WANDB_PROJECT:-crl-reppo}"
@@ -78,7 +79,7 @@ bool_flag() {
 }
 
 echo "[env-sweep] task=${TASK_ID} env=${ENV_ID} seed=${SEED}"
-echo "[env-sweep] HER_CRITIC=${HER_CRITIC} HER_ACTOR=${HER_ACTOR} HER_TD_LAMBDA=${HER_TD_LAMBDA}"
+echo "[env-sweep] HER_CRITIC=${HER_CRITIC} HER_ACTOR=${HER_ACTOR} HER_TD_LAMBDA=${HER_TD_LAMBDA} HER_PER_EPOCH=${HER_PER_EPOCH}"
 
 uv run train_reppo.py \
 	--env-id      "${ENV_ID}" \
@@ -87,6 +88,7 @@ uv run train_reppo.py \
 	$(bool_flag use-her-critic            "${HER_CRITIC}") \
 	$(bool_flag use-her-actor             "${HER_ACTOR}") \
 	$(bool_flag use-her-td-lambda         "${HER_TD_LAMBDA}") \
+	$(bool_flag her-per-epoch             "${HER_PER_EPOCH}") \
 	--her-k "${HER_K}" \
 	--actor-depth  "${DEPTH}" \
 	--critic-depth "${DEPTH}" \
