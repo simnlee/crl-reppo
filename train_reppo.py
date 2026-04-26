@@ -2302,6 +2302,8 @@ def train(args: Args):
             **update_metrics,
             **compute_stagger_debug_metrics(transitions),
             **prefix_dict("episode", train_episode_metrics),
+            "rollout/done_frac": jnp.mean(transitions.done.astype(jnp.float32)),
+            "rollout/trunc_frac": jnp.mean(transitions.truncated.astype(jnp.float32)),
         }
         state = state.replace(iteration=state.iteration + 1)
         return state, metrics
@@ -2310,8 +2312,15 @@ def train(args: Args):
     def training_epoch(train_state, keys):
         """Scan train_step for eval_interval iterations under a single jit."""
         train_state, metrics = jax.lax.scan(train_step, train_state, keys)
-        metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics)
-        return train_state, metrics
+        reduced = {}
+        for k, v in metrics.items():
+            if k.startswith("rollout/"):
+                reduced[f"{k}_min"] = jnp.min(v)
+                reduced[f"{k}_max"] = jnp.max(v)
+                reduced[f"{k}_mean"] = jnp.mean(v)
+            else:
+                reduced[k] = v[-1]
+        return train_state, reduced
 
     # --- Eval wiring (CrlEvaluator) --------------------------------------
     def deterministic_actor_step(training_state: ReppoTrainingState, env_, env_state, extra_fields=()):
