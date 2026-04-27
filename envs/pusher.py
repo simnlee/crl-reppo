@@ -104,8 +104,7 @@ class Pusher(PipelineEnv):
     reward_near = -math.safe_norm(vec_1)
     reward_dist = -obj_to_goal_dist
     reward_ctrl = -jp.square(action).sum()
-    success = jp.array(obj_to_goal_dist < 0.1, dtype=float)
-    reward = success
+    reward = reward_dist + 0.1 * reward_ctrl + 0.5 * reward_near
 
     pipeline_state = self.pipeline_step(state.pipeline_state, action)
 
@@ -113,7 +112,7 @@ class Pusher(PipelineEnv):
         seed = state.info["seed"] + jp.where(state.info["steps"], 0, 1)
     else:
         seed = state.info["seed"]
-
+        
     info = {"seed": seed}
 
     obs = self._get_obs(pipeline_state)
@@ -121,7 +120,7 @@ class Pusher(PipelineEnv):
         reward_near=reward_near,
         reward_dist=reward_dist,
         reward_ctrl=reward_ctrl,
-        success=success,
+        success=jp.array(obj_to_goal_dist < 0.1, dtype=float),
         success_hard=jp.array(obj_to_goal_dist < 0.05, dtype=float)
     )
     state.info.update(info)
@@ -228,8 +227,8 @@ class PusherReacher(PipelineEnv):
 
     arm_to_goal_dist = math.safe_norm(x_i.pos[self._goal_idx] - x_i.pos[self._tips_arm_idx])
 
-    success = jp.array(arm_to_goal_dist < 0.1, dtype=float)
-    reward = success
+    reward_dist = -arm_to_goal_dist
+    reward = reward_dist
 
     pipeline_state = self.pipeline_step(state.pipeline_state, action)
 
@@ -237,15 +236,15 @@ class PusherReacher(PipelineEnv):
         seed = state.info["seed"] + jp.where(state.info["steps"], 0, 1)
     else:
         seed = state.info["seed"]
-
+        
     info = {"seed": seed}
 
     obs = self._get_obs(pipeline_state)
     state.metrics.update(
         reward_near=0.0,
-        reward_dist=-arm_to_goal_dist,
+        reward_dist=reward_dist,
         reward_ctrl=0.0,
-        success=success,
+        success=jp.array(arm_to_goal_dist < 0.1, dtype=float),
         success_hard=jp.array(arm_to_goal_dist < 0.05, dtype=float)
     )
     state.info.update(info)

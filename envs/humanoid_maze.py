@@ -260,9 +260,9 @@ class HumanoidMaze(PipelineEnv):
         distance_to_target = jnp.linalg.norm(obs[:3] - obs[-3:])
 
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
+        reward = -distance_to_target + healthy_reward - ctrl_cost
         success = jnp.array(distance_to_target < 0.5, dtype=float)
         success_easy = jnp.array(distance_to_target < 2., dtype=float)
-        reward = success
         state.metrics.update(
             forward_reward=forward_reward,
             reward_linvel=forward_reward,
