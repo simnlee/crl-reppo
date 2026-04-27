@@ -136,12 +136,12 @@ class Ant(PipelineEnv):
         contact_cost = 0.0
 
         obs = self._get_obs(pipeline_state)
+        reward = forward_reward + healthy_reward - ctrl_cost - contact_cost
         done = 1.0 - is_healthy if self._terminate_when_unhealthy else 0.0
 
         dist = jp.linalg.norm(obs[:2] - obs[-2:])
         success = jp.array(dist < 0.5, dtype=float)
         success_easy = jp.array(dist < 2., dtype=float)
-        reward = success
 
         state.metrics.update(
             reward_forward=forward_reward,

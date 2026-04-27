@@ -143,9 +143,7 @@ class NormalizationState(struct.PyTreeNode):
 class Normalizer:
     """Welford online estimator of per-feature mean and variance.
 
-    ``update`` folds a fresh batch into the running moments; ``update_masked``
-    does the same but only counts entries where ``mask=True`` (used so that
-    frozen ticks under staggered resets do not perturb the statistics).
+    ``update`` folds a fresh batch into the running moments;
     ``normalize`` returns ``(x - mean) / sqrt(var + 1e-8)``.
     """
 
@@ -182,50 +180,6 @@ class Normalizer:
         )
         return state.replace(mean=mean, var=var, count=count)
 
-    def _compute_stats_masked(
-        self, state_mean, state_var, state_count, obs: jax.Array, mask: jax.Array
-    ):
-        # obs: (N, *D), mask: (N,) with 0/1 float weights.
-        w = mask.astype(jnp.float32)
-        batch_size = jnp.sum(w)
-        safe_n = jnp.maximum(batch_size, 1.0)
-        w_exp = w.reshape((-1,) + (1,) * (obs.ndim - 1))
-        batch_mean = jnp.sum(w_exp * obs, axis=0) / safe_n
-        batch_var = jnp.sum(w_exp * jnp.square(obs - batch_mean), axis=0) / safe_n
-
-        delta = batch_mean - state_mean
-        count = state_count + batch_size
-        safe_count = jnp.maximum(count, 1.0)
-        new_mean = state_mean + delta * batch_size / safe_count
-        m_a = state_var * state_count
-        m_b = batch_var * batch_size
-        M2 = m_a + m_b + jnp.square(delta) * state_count * batch_size / safe_count
-        new_var = M2 / safe_count
-
-        nonempty = batch_size > 0
-        new_mean = jnp.where(nonempty, new_mean, state_mean)
-        new_var = jnp.where(nonempty, new_var, state_var)
-        new_count = jnp.where(nonempty, count, state_count).astype(state_count.dtype)
-        return new_mean, new_var, new_count
-
-    @functools.partial(jax.jit, static_argnums=0)
-    def update_masked(
-        self,
-        state: NormalizationState,
-        tree: struct.PyTreeNode,
-        mask: jax.Array,
-    ) -> NormalizationState:
-        tree = jax.tree_util.tree_map(lambda x, m: x.reshape(-1, *m.shape), tree, state.mean)
-        flat_mask = mask.reshape(-1)
-        stats = jax.tree_util.tree_map(
-            lambda m, v, c, x: self._compute_stats_masked(m, v, c, x, flat_mask),
-            state.mean, state.var, state.count, tree,
-        )
-        mean, var, count = jax.tree_util.tree_transpose(
-            jax.tree_util.tree_structure(tree), jax.tree_util.tree_structure(("*", "*", "*")), stats,
-        )
-        return state.replace(mean=mean, var=var, count=count)
-
     @functools.partial(jax.jit, static_argnums=0)
     def normalize(self, state: NormalizationState, tree: struct.PyTreeNode) -> struct.PyTreeNode:
         return jax.tree_util.tree_map(
@@ -235,7 +189,7 @@ class Normalizer:
 
 
 # =============================================================================
-# AutoResetWrapper + StaggeredResetWrapper + wrap_for_training
+# AutoResetWrapper + wrap_for_training
 # =============================================================================
 
 
@@ -273,176 +227,15 @@ class AutoResetWrapper(Wrapper):
         return state.replace(pipeline_state=pipeline_state, obs=obs)
 
 
-class StaggeredResetWrapper(Wrapper):
-    """Reset wrapper implementing reset gate mechanism.
-
-    When ``state.info['active']`` is all-False (the pre-stagger phase),
-    behaves identically to :class:`AutoResetWrapper`: any env whose new
-    ``done=True`` is reset to the cached initial state on the same tick.
-
-    When active, the wrapper emits a real terminal transition on the tick
-    of an intrinsic termination (``done=True`` with ``truncation=0``):
-
-    * ``reward`` and ``done=1`` and ``truncation=0`` are preserved — the
-      transition is like a MDP terminal step (``valid_mask=True``).
-    * The carry ``obs`` is reset to ``first_obs`` (via ``reset_mask``) so
-      the *next* tick's env.step starts from a clean initial state.
-    * ``is_waiting`` flips True so the next tick freezes cleanly.
-
-    On subsequent ticks while ``is_waiting=True`` the wrapper freezes:
-
-    * ``pipeline_state`` and ``obs`` revert to the pre-step carry.
-    * ``reward``, ``done``, and ``truncation`` are zeroed.
-    * The EpisodeWrapper step counter is held frozen.
-    * The transition emits ``valid_mask=False``.
-
-    Every group's ``group_step`` counter advances in lockstep each tick.
-    When it reaches the episode horizon ``H``, every env with that
-    ``group_idx`` resets together — a 'group reset gate'. The gate tick
-    emits ``truncation=1`` unconditionally (even when the env was waiting)
-    so HER's ``boundaries = max(done, truncated)`` detects the gate as an
-    episode boundary. The gate tick itself is emitted with
-    ``valid_mask=False`` because the
-    ``(obs_before_reset, action, 0, first_obs, ...)`` transition is not a
-    real MDP step.
-    """
-
-    def __init__(self, env, group_idx: jax.Array, episode_length: int):
-        super().__init__(env)
-        self._group_idx = group_idx
-        self._num_envs = int(group_idx.shape[0])
-        self._H = int(episode_length)
-
-    def reset(self, rng):
-        state = self.env.reset(rng)
-        state.info["first_pipeline_state"] = state.pipeline_state
-        state.info["first_obs"] = state.obs
-        state.info["raw_obs"] = state.obs
-        state.info["group_idx"] = self._group_idx
-        state.info["group_step"] = jnp.zeros((self._num_envs,), dtype=jnp.int32)
-        state.info["is_waiting"] = jnp.zeros((self._num_envs,), dtype=jnp.bool_)
-        state.info["valid_mask"] = jnp.ones((self._num_envs,), dtype=jnp.bool_)
-        state.info["active"] = jnp.zeros((self._num_envs,), dtype=jnp.bool_)
-        return state
-
-    def step(self, state, action):
-        active = state.info["active"]
-        was_waiting = state.info["is_waiting"]
-        prev_pipeline = state.pipeline_state
-        prev_obs = state.obs
-        prev_raw_obs = state.info["raw_obs"]
-        prev_steps = state.info["steps"]
-        prev_group_step = state.info["group_step"]
-
-        # Zero EpisodeWrapper's step counter where the incoming state is done=True, then clear done before stepping.
-        state.info["steps"] = jnp.where(
-            state.done, jnp.zeros_like(prev_steps), prev_steps
-        )
-        state = state.replace(done=jnp.zeros_like(state.done))
-        state = self.env.step(state, action)
-
-        intrinsic_done = (state.done > 0) & (state.info["truncation"] == 0)
-        freeze_now = active & was_waiting
-        enters_waiting = active & intrinsic_done & (~was_waiting)
-        group_step_new = prev_group_step + 1
-        gate_now = active & (group_step_new >= self._H)
-
-        def _where(mask, on_true, on_false):
-            """Broadcast mask over leading axis and select on_true where True."""
-            if not hasattr(on_true, "shape"):
-                return on_false
-            if on_true.shape and on_true.shape[0] == mask.shape[0]:
-                shaped = jnp.reshape(
-                    mask, (mask.shape[0],) + (1,) * (on_true.ndim - 1)
-                )
-                return jnp.where(shaped, on_true, on_false)
-            return on_false
-
-        # Freeze path: revert stepped leaves to their pre-step counterparts.
-        pipeline_after_freeze = jax.tree_util.tree_map(
-            lambda new_leaf, old_leaf: _where(freeze_now, old_leaf, new_leaf),
-            state.pipeline_state, prev_pipeline,
-        )
-        obs_after_freeze = _where(freeze_now, prev_obs, state.obs)
-        reward_after_freeze = jnp.where(
-            freeze_now, jnp.zeros_like(state.reward), state.reward
-        )
-        done_after_freeze = jnp.where(
-            freeze_now, jnp.zeros_like(state.done), state.done
-        )
-        steps_after_freeze = jnp.where(freeze_now, prev_steps, state.info["steps"])
-        trunc_after_freeze = jnp.where(
-            gate_now,
-            jnp.ones_like(state.info["truncation"]),
-            jnp.where(
-                freeze_now,
-                jnp.zeros_like(state.info["truncation"]),
-                state.info["truncation"],
-            ),
-        )
-        raw_obs_after_freeze = _where(freeze_now, prev_raw_obs, state.obs)
-
-        # Reset path: staggered gate, terminal-this-tick, OR pre-stagger autoreset.
-        passthrough_reset = (~active) & done_after_freeze.astype(jnp.bool_)
-        reset_mask = gate_now | passthrough_reset | enters_waiting
-
-        pipeline_final = jax.tree_util.tree_map(
-            lambda cur, first: _where(reset_mask, first, cur),
-            pipeline_after_freeze, state.info["first_pipeline_state"],
-        )
-        obs_final = _where(reset_mask, state.info["first_obs"], obs_after_freeze)
-
-        # Bookkeeping
-        group_step_final = jnp.where(
-            gate_now, jnp.zeros_like(group_step_new), group_step_new
-        )
-        is_waiting_final = jnp.where(
-            gate_now,
-            jnp.zeros_like(was_waiting),
-            freeze_now | enters_waiting,
-        )
-        valid_mask_final = jnp.where(
-            active, (~freeze_now) & (~gate_now), jnp.ones_like(active)
-        )
-        steps_final = jnp.where(
-            reset_mask, jnp.zeros_like(steps_after_freeze), steps_after_freeze
-        )
-
-        state.info["steps"] = steps_final
-        state.info["truncation"] = trunc_after_freeze
-        state.info["raw_obs"] = raw_obs_after_freeze
-        state.info["group_step"] = group_step_final
-        state.info["is_waiting"] = is_waiting_final
-        state.info["valid_mask"] = valid_mask_final
-
-        return state.replace(
-            pipeline_state=pipeline_final,
-            obs=obs_final,
-            reward=reward_after_freeze,
-            done=done_after_freeze,
-        )
-
-
 def wrap_for_training(
     env: PipelineEnv,
     episode_length: int,
     action_repeat: int = 1,
-    *,
-    stagger_envs: bool = False,
-    group_idx: "jax.Array | None" = None,
 ):
-    """VmapWrapper -> EpisodeWrapper -> (AutoReset|StaggeredReset) with raw_obs.
-
-    When ``stagger_envs`` is True and ``group_idx`` is provided, the outer
-    reset wrapper is :class:`StaggeredResetWrapper`. Otherwise the default
-    path is byte-identical to the original: :class:`AutoResetWrapper`.
-    """
+    """VmapWrapper -> EpisodeWrapper -> AutoResetWrapper with raw_obs."""
     env = VmapWrapper(env)
     env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=action_repeat)
-    if stagger_envs and group_idx is not None:
-        env = StaggeredResetWrapper(env, group_idx, episode_length)
-    else:
-        env = AutoResetWrapper(env)
+    env = AutoResetWrapper(env)
     return env
 
 
@@ -848,9 +641,8 @@ def make_env(env_id: str):
 #
 # Transition        : NamedTuple consumed by the evaluator; carries
 #                     (observation, action, reward, discount, extras).
-# RolloutTransition : rollout-time PyTree with extra fields for HER goal
-#                     relabeling (`next_obs`) and for staggered resets
-#                     (`valid_mask`, `truncated`).
+# RolloutTransition : rollout-time PyTree with an extra `next_obs` field
+#                     for HER goal relabeling.
 # =============================================================================
 
 
@@ -864,16 +656,11 @@ class Transition(NamedTuple):
 
 
 class RolloutTransition(struct.PyTreeNode):
-    """Rollout transition struct with extra fields for HER and staggered resets.
+    """Rollout transition struct with an extra ``next_obs`` field for HER.
 
     ``next_obs`` is the pre-auto-reset next observation so that HER goal
     relabeling can read the achieved goal from the true continuation, even
     when the env has just been auto-reset.
-
-    ``valid_mask`` marks transitions that should contribute to learning
-    losses. False for frozen steps (when an env is idling for its group's
-    reset gate under staggered resets) and for the gate-reset tick itself.
-    Always True when staggered resets are disabled.
     """
     obs: jax.Array
     action: jax.Array
@@ -881,7 +668,6 @@ class RolloutTransition(struct.PyTreeNode):
     next_obs: jax.Array
     done: jax.Array
     truncated: jax.Array
-    valid_mask: jax.Array
     extras: dict
 
 
@@ -1032,9 +818,7 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
 # goal_indices, goal_reach_thresh, replace_goal_in_obs, fusion_dim).
 #
 # nstep_lambda                    : reverse-scan TD-lambda return on the
-#                                   original trajectory. Skips freeze ticks
-#                                   but keeps boundary (truncated / done)
-#                                   ticks so they bootstrap earlier ticks.
+#                                   original trajectory.
 # compute_extras                  : for the original trajectory, compute the
 #                                   max-entropy soft reward
 #                                      r - gamma * alpha * log pi(a_{t+1})
@@ -1079,7 +863,6 @@ def make_td_lambda_helpers(
             reward = transition.extras["soft_reward"]
             next_value = transition.extras["next_value"]
             truncated = transition.truncated
-            valid = transition.valid_mask
             # Lambda mixes the upstream return (lambda) with the bootstrap
             # V(next) (1 - lambda). lambda=1 recovers the Monte-Carlo
             # return; lambda=0 recovers TD(0).
@@ -1089,11 +872,6 @@ def make_td_lambda_helpers(
             lambda_return = reward + args.gamma * jnp.where(
                 truncated, next_value, (1.0 - done) * lambda_sum
             )
-            # Skip pure freeze ticks; keep gate ticks so their truncation
-            # bootstrap propagates to earlier ticks of the old episode.
-            is_boundary = (truncated > 0) | (done > 0)
-            skip = (~valid.astype(jnp.bool_)) & (~is_boundary)
-            lambda_return = jnp.where(skip, returns, lambda_return)
             return lambda_return, lambda_return
 
         # Reverse scan across time. init = V(next) at the last rollout step,
@@ -1314,13 +1092,9 @@ def make_td_lambda_helpers(
             is_boundary = (u == end)
             is_interior = (t_idx <= u) & (u < end)
 
-            valid_u = batch_raw.valid_mask[u]
-            valid_b = valid_u[None, :]
-            valid_f = valid_b.astype(rho.dtype)
-
             # Track the mean clipped IS ratio over interior ticks (logged).
-            rho_sum = rho_sum + jnp.sum(rho * is_interior * valid_f)
-            rho_count = rho_count + jnp.sum(is_interior * valid_f)
+            rho_sum = rho_sum + jnp.sum(rho * is_interior)
+            rho_count = rho_count + jnp.sum(is_interior.astype(rho.dtype))
 
             # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
             G_bnd = soft_r_bnd + args.gamma * jnp.where(
@@ -1335,19 +1109,13 @@ def make_td_lambda_helpers(
                 * ((1.0 - args.lmbda * rho) * V_u + args.lmbda * rho * G),
             )
 
-            # Allow the scan to write at episode-boundary ticks (gate ticks
-            # carry truncated=1 with valid_mask=0) so G_bnd still flows
-            # backward into the interior's lambda * rho * G term at earlier ticks.
-            boundary_u = (term_u[None, :] > 0) | (trunc_u[None, :] > 0)
-            write_allowed = valid_b | boundary_u
             G_new = jnp.where(
                 is_boundary, G_bnd, jnp.where(is_interior, G_int, G)
             )
-            G_new = jnp.where(write_allowed, G_new, G)
 
             # Save the fused embedding for the critic's auxiliary target,
-            # but only at the original step u == t and only on valid ticks.
-            write_emb = ((u == t_idx) & valid_b)[..., None]
+            # but only at the original step u == t.
+            write_emb = (u == t_idx)[..., None]
             next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
 
             return (G_new, rng, rho_sum, rho_count, next_emb_acc), None
@@ -1389,9 +1157,8 @@ def make_td_lambda_helpers(
 def compute_stagger_schedule(args: "Args"):
     """Return (stagger_step_size, num_groups, group_idx) for the given args.
 
-    Shared by :func:`wrap_for_training` (needs ``group_idx`` at wrap time so
-    :class:`StaggeredResetWrapper` can stash it in ``state.info``) and by
-    :func:`make_stagger_helpers` (warmup uses the same partitioning).
+    Used by :func:`make_stagger_helpers` to partition envs into groups for
+    the initial offset warmup.
     """
     step_size = int(args.stagger_step_size) if args.stagger_step_size else int(args.num_steps)
     if step_size <= 0:
@@ -1487,32 +1254,15 @@ def make_stagger_helpers(args: "Args", env):
         num_groups = max(-(-int(args.episode_length) // stagger_step_size), 1)
 
         steps = transitions.extras["steps"].astype(jnp.int32)
-        valid_mask = transitions.valid_mask.astype(jnp.bool_)
-        valid_flat = valid_mask.reshape(-1)
 
         phase_idx = jnp.clip(
             jnp.maximum(steps - 1, 0) // stagger_step_size, 0, num_groups - 1
         )
-        phase_weights = valid_flat.astype(jnp.float32)
-        phase_counts = jnp.bincount(
-            phase_idx.reshape(-1), weights=phase_weights, length=num_groups
-        )
+        phase_counts = jnp.bincount(phase_idx.reshape(-1), length=num_groups)
         phase_fracs = phase_counts / jnp.maximum(jnp.sum(phase_counts), 1.0)
 
-        steps_for_minmax = jnp.where(valid_mask, steps, jnp.iinfo(jnp.int32).max)
-        steps_for_maxmax = jnp.where(valid_mask, steps, jnp.iinfo(jnp.int32).min)
-        any_valid = jnp.any(valid_mask)
-        step_min = jnp.where(any_valid, jnp.min(steps_for_minmax), 0)
-        step_max = jnp.where(any_valid, jnp.max(steps_for_maxmax), 0)
-
-        is_waiting = transitions.extras.get("is_waiting")
-        waiting_frac = (
-            jnp.mean(is_waiting.astype(jnp.float32))
-            if is_waiting is not None
-            else jnp.array(0.0)
-        )
-        gate_frac = jnp.mean((~valid_mask).astype(jnp.float32)) - waiting_frac
-        gate_frac = jnp.maximum(gate_frac, 0.0)
+        step_min = jnp.min(steps)
+        step_max = jnp.max(steps)
 
         metrics = {
             "stagger/step_min": step_min,
@@ -1521,9 +1271,6 @@ def make_stagger_helpers(args: "Args", env):
             "stagger/group_coverage_frac": jnp.mean(phase_counts > 0),
             "stagger/group_frac_min": jnp.min(phase_fracs),
             "stagger/group_frac_max": jnp.max(phase_fracs),
-            "stagger/valid_frac": jnp.mean(valid_mask.astype(jnp.float32)),
-            "stagger/waiting_frac": waiting_frac,
-            "stagger/gate_frac": gate_frac,
         }
         if num_groups <= 16:
             metrics.update(
@@ -1533,27 +1280,6 @@ def make_stagger_helpers(args: "Args", env):
                 }
             )
         return metrics
-
-    def _activate_env_state(env_state, offset_steps):
-        """Stamp the StaggeredResetWrapper bookkeeping fields for training.
-
-        ``group_step = offset_steps`` makes each group's first reset gate
-        fire at ``H - j*K`` ticks from warmup end, after which all groups
-        run full-length episodes in lockstep (offset by ``K``).
-        ``active = True`` switches the wrapper out of AutoReset passthrough.
-        Safe no-op when :class:`StaggeredResetWrapper` is not installed
-        (the keys simply overwrite with values the wrapper would ignore).
-        """
-        info = env_state.info
-        if "group_step" in info:
-            info["group_step"] = offset_steps
-        if "is_waiting" in info:
-            info["is_waiting"] = jnp.zeros_like(info["is_waiting"])
-        if "valid_mask" in info:
-            info["valid_mask"] = jnp.ones_like(info["valid_mask"])
-        if "active" in info:
-            info["active"] = jnp.ones_like(info["active"])
-        return env_state
 
     def stagger_env_state(key, env_state):
         """Advance envs to staggered rollout offsets before training starts."""
@@ -1576,7 +1302,6 @@ def make_stagger_helpers(args: "Args", env):
         offset_steps = group_idx * stagger_step_size
 
         if max_offset <= 0:
-            env_state = _activate_env_state(env_state, offset_steps)
             return env_state, {
                 "enabled": True,
                 "step_size": stagger_step_size,
@@ -1608,7 +1333,6 @@ def make_stagger_helpers(args: "Args", env):
             init=(key, env_state, jnp.zeros(args.num_envs, dtype=jnp.int32)),
             xs=jnp.arange(max_offset, dtype=jnp.int32),
         )
-        env_state = _activate_env_state(env_state, offset_steps)
         return env_state, {
             "enabled": True,
             "step_size": stagger_step_size,
@@ -1917,7 +1641,6 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
 class ReppoTrainingState:
     """Training state: networks, optimizer state, RMS stats, and last env state."""
     env_steps: jnp.ndarray
-    valid_env_steps: jnp.ndarray
     iteration: jnp.ndarray
     actor_state: TrainState
     critic_state: TrainState
@@ -1978,16 +1701,10 @@ def train(args: Args):
     goal_indices = jnp.arange(goal_start_idx, goal_end_idx)
     goal_reach_thresh = args.goal_reach_thresh
 
-    if args.stagger_envs:
-        _, _, stagger_group_idx = compute_stagger_schedule(args)
-    else:
-        stagger_group_idx = None
     env = wrap_for_training(
         env_raw,
         episode_length=args.episode_length,
         action_repeat=args.action_repeat,
-        stagger_envs=args.stagger_envs,
-        group_idx=stagger_group_idx,
     )
 
     eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
@@ -2118,7 +1835,6 @@ def train(args: Args):
 
         return ReppoTrainingState(
             env_steps=jnp.int32(0),
-            valid_env_steps=jnp.int32(0),
             iteration=jnp.int32(0),
             actor_state=actor_state,
             critic_state=critic_state,
@@ -2150,12 +1866,6 @@ def train(args: Args):
             # Clip strictly inside the tanh range for a finite log-prob.
             action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_env_state = env.step(env_state, action)
-            # valid_mask is only meaningful under staggered resets; it is
-            # all-True under AutoResetWrapper (the default).
-            valid_mask = next_env_state.info.get(
-                "valid_mask",
-                jnp.ones_like(next_env_state.done, dtype=jnp.bool_),
-            )
             transition = RolloutTransition(
                 obs=env_state.obs,
                 action=action,
@@ -2163,7 +1873,6 @@ def train(args: Args):
                 next_obs=next_env_state.info["raw_obs"],
                 done=next_env_state.done,
                 truncated=next_env_state.info["truncation"],
-                valid_mask=valid_mask,
                 extras={
                     **next_env_state.info,
                     "train_metrics": next_env_state.metrics,
@@ -2179,13 +1888,9 @@ def train(args: Args):
             length=args.num_steps,
         )
         _, last_env_state = rollout_state
-        # Track both total env steps and valid-only env steps (they differ
-        # only under staggered resets, where frozen ticks do not count).
-        valid_count = jnp.sum(transitions.valid_mask.astype(jnp.int32))
         train_state = train_state.replace(
             last_env_state=last_env_state,
             env_steps=train_state.env_steps + args.num_steps * args.num_envs,
-            valid_env_steps=train_state.valid_env_steps + valid_count,
         )
         return transitions, train_state
 
@@ -2217,8 +1922,8 @@ def train(args: Args):
         # --- Update observation normalizer, then normalize with *pre-update*
         #     stats so every obs fed to the networks this iteration matches
         #     the stats the targets were computed against (matches v6). ---
-        new_norm_state = normalizer.update_masked(
-            train_state.normalization_state, batch.obs, batch.valid_mask
+        new_norm_state = normalizer.update(
+            train_state.normalization_state, batch.obs
         )
         norm_state = train_state.normalization_state
         batch = batch.replace(
@@ -2239,14 +1944,14 @@ def train(args: Args):
         )
 
         # --- Flatten the per-iteration original slice once. ---
-        batch.extras["weight"] = batch.valid_mask.astype(jnp.float32)
+        batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
         orig_flat = jax.tree_util.tree_map(
             lambda x: x.reshape((N, *x.shape[2:])), batch
         )
         orig_stripped = orig_flat.replace(
             extras={
                 "target_values": orig_flat.extras["target_values"],
-                "weight": orig_flat.valid_mask.astype(jnp.float32),
+                "weight": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
                 "next_emb": orig_flat.extras["next_emb"],
             }
         )
@@ -2341,9 +2046,6 @@ def train(args: Args):
                 batch.action[:, :, None, :],
                 (S, E, k, batch.action.shape[-1]),
             )
-            valid_mask_alt = jnp.broadcast_to(
-                batch.valid_mask[:, :, None], (S, E, k)
-            )
             alt_batch = RolloutTransition(
                 obs=obs_alt,
                 action=action_alt,
@@ -2351,10 +2053,9 @@ def train(args: Args):
                 next_obs=next_obs_alt,
                 done=done_alt,
                 truncated=truncated_alt,
-                valid_mask=valid_mask_alt,
                 extras={
                     "target_values": jax.lax.stop_gradient(target_values_alt),
-                    "weight": weight_alt * valid_mask_alt.astype(jnp.float32),
+                    "weight": weight_alt,
                     "next_emb": jax.lax.stop_gradient(next_emb_alt),
                 },
             )
@@ -2420,8 +2121,8 @@ def train(args: Args):
         # The update uses the fresh batch; the batch itself is normalized
         # below with the *pre-update* stats so targets and losses are
         # consistent with the stats the networks were trained on.
-        new_norm_state = normalizer.update_masked(
-            train_state.normalization_state, batch.obs, batch.valid_mask
+        new_norm_state = normalizer.update(
+            train_state.normalization_state, batch.obs
         )
         norm_state = train_state.normalization_state
 
@@ -2507,7 +2208,7 @@ def train(args: Args):
 
             # --- 7. Build the combined batch: original (S*E rows, w=1) plus
             #        hindsight (k*S*E rows, w = 1 or 1/m_t) flattened over time/env ---
-            batch.extras["weight"] = batch.valid_mask.astype(jnp.float32)
+            batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
             orig_flat = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
             # The behavior action is the same for every hindsight slot at a
@@ -2515,7 +2216,6 @@ def train(args: Args):
             action_alt = jnp.broadcast_to(
                 batch.action[:, :, None, :], (S, E, k, batch.action.shape[-1])
             )
-            valid_mask_alt = jnp.broadcast_to(batch.valid_mask[:, :, None], (S, E, k))
             alt_batch = RolloutTransition(
                 obs=obs_alt,
                 action=action_alt,
@@ -2523,10 +2223,9 @@ def train(args: Args):
                 next_obs=next_obs_alt,
                 done=done_alt,
                 truncated=truncated_alt,
-                valid_mask=valid_mask_alt,
                 extras={
                     "target_values": jax.lax.stop_gradient(target_values_alt),
-                    "weight": weight_alt * valid_mask_alt.astype(jnp.float32),
+                    "weight": weight_alt,
                     "next_emb": jax.lax.stop_gradient(next_emb_alt),
                 },
             )
@@ -2537,7 +2236,7 @@ def train(args: Args):
             orig_stripped = orig_flat.replace(
                 extras={
                     "target_values": orig_flat.extras["target_values"],
-                    "weight": orig_flat.valid_mask.astype(jnp.float32),
+                    "weight": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
                     "next_emb": orig_flat.extras["next_emb"],
                 }
             )
@@ -2569,7 +2268,7 @@ def train(args: Args):
         else:
             # No HER: flatten the S x E batch and run num_epochs of joint
             # critic + actor SGD on the original trajectory alone.
-            batch.extras["weight"] = batch.valid_mask.astype(jnp.float32)
+            batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
             batch = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
             key, train_key = jax.random.split(key)
@@ -2603,6 +2302,8 @@ def train(args: Args):
             **update_metrics,
             **compute_stagger_debug_metrics(transitions),
             **prefix_dict("episode", train_episode_metrics),
+            "rollout/done_frac": jnp.mean(transitions.done.astype(jnp.float32)),
+            "rollout/trunc_frac": jnp.mean(transitions.truncated.astype(jnp.float32)),
         }
         state = state.replace(iteration=state.iteration + 1)
         return state, metrics
@@ -2611,8 +2312,15 @@ def train(args: Args):
     def training_epoch(train_state, keys):
         """Scan train_step for eval_interval iterations under a single jit."""
         train_state, metrics = jax.lax.scan(train_step, train_state, keys)
-        metrics = jax.tree_util.tree_map(lambda x: x[-1], metrics)
-        return train_state, metrics
+        reduced = {}
+        for k, v in metrics.items():
+            if k.startswith("rollout/"):
+                reduced[f"{k}_min"] = jnp.min(v)
+                reduced[f"{k}_max"] = jnp.max(v)
+                reduced[f"{k}_mean"] = jnp.mean(v)
+            else:
+                reduced[k] = v[-1]
+        return train_state, reduced
 
     # --- Eval wiring (CrlEvaluator) --------------------------------------
     def deterministic_actor_step(training_state: ReppoTrainingState, env_, env_state, extra_fields=()):
@@ -2725,21 +2433,15 @@ def train(args: Args):
 
         sps = (eval_interval * args.num_steps * args.num_envs) / epoch_time
         env_step_count = int(train_state.env_steps)
-        valid_step_count = int(train_state.valid_env_steps)
         training_metrics = {
             "training/sps": sps,
             "training/walltime": training_walltime,
             "training/env_steps": env_step_count,
-            "training/valid_env_steps": valid_step_count,
-            "training/valid_env_steps_frac": (
-                valid_step_count / max(1, env_step_count)
-            ),
             **{f"training/{k}": v for k, v in train_metrics.items()},
         }
 
         metrics = evaluator.run_evaluation(train_state, training_metrics)
-        current_step = valid_step_count if args.stagger_envs else env_step_count
-        log_metrics(current_step, eval_epoch, metrics)
+        log_metrics(env_step_count, eval_epoch, metrics)
 
         # Checkpoint cadence: first 5 eval epochs, last 5, and every 10th.
         should_checkpoint = (
@@ -2755,11 +2457,9 @@ def train(args: Args):
 
     # Final checkpoint + optional capture_vis
     final_env_step = int(train_state.env_steps)
-    final_valid_step = int(train_state.valid_env_steps)
     checkpoint(train_state, tag=f"final_{final_env_step}")
     if args.capture_vis:
-        vis_step = final_valid_step if args.stagger_envs else final_env_step
-        capture_vis_to_wandb(train_state, step=vis_step)
+        capture_vis_to_wandb(train_state, step=final_env_step)
         if trigger_sync is not None:
             trigger_sync()
 
