@@ -78,7 +78,7 @@ class Args:
     num_envs: int = 128
     num_eval_envs: int = 256
     num_steps: int = 1000
-    num_mini_batches: int = 64         # minibatch size = num_steps*num_envs / num_mini_batches
+    num_mini_batches: int = 64 # minibatch size = num_steps*num_envs / num_mini_batches
     num_epochs: int = 8
     num_eval: int = 200
     total_time_steps: int = 50_000_000
@@ -108,7 +108,6 @@ class Args:
     use_her_td_lambda: bool = False
     her_k: int = 4
     her_goal_sampling: str = "uniform"   # 'uniform'|'geometric'
-    normalize_hindsight_loss: bool = False
     sample_new_action_for_tdL: bool = False
     her_per_epoch: bool = False          # v7b: resample HER + recompute hindsight TD-lambda every inner epoch
 
@@ -707,11 +706,11 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
         segment [t, end_idx[t]] (up to episode boundary), and take the
         achieved goal at each sampled step as a hindsight goal. Supports
         uniform or geometric sampling over future offsets. Slots with fewer
-        than k available future steps are marked with weight=0 and
+        than k available future steps are marked with valid_mask=0 and
         truncated=1 so they are zeroed out of the critic loss.
 
         Returns (obs_alt, next_obs_alt, reward_alt, done_alt, trunc_alt,
-                 weight_alt, g_alt, end_idx).
+                 valid_mask_alt, g_alt, end_idx).
         """
         S, E, k = args.num_steps, args.num_envs, args.her_k
 
@@ -780,22 +779,16 @@ def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thres
         # Invalid slots are marked truncated=1 so (1 - truncated) zeros them in L_Q.
         trunc_alt = jnp.where(valid, trunc_alt, 1.0)
 
-        if args.normalize_hindsight_loss:
-            # Weight each valid slot by 1/m_t so each step contributes a
-            # total hindsight mass of 1 regardless of how many valid slots
-            # it has.
-            m_t = jnp.minimum(k, range_size)
-            weight_alt = jnp.where(valid, 1.0 / m_t[:, :, None], 0.0)
-        else:
-            # Every valid slot contributes with weight 1.
-            weight_alt = jnp.where(valid, 1.0, 0.0)
+        # Validity mask: 1 for valid hindsight slots, 0 for invalid ones
+        # (which carry garbage future_idx data and must be excluded).
+        valid_mask_alt = jnp.where(valid, 1.0, 0.0)
         return (
             obs_alt,
             next_obs_alt,
             reward_alt,
             done_alt,
             trunc_alt,
-            weight_alt,
+            valid_mask_alt,
             g_alt,
             end_idx,
         )
@@ -1391,15 +1384,15 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
             axis=-1,
         )
 
-        # Weighted mean over the minibatch: w = 1 for original samples,
-        # w = 1/m_t (or 1) for hindsight samples. (1 - truncated) zeroes
-        # out time-limit and invalid-slot transitions.
-        w = minibatch.extras["weight"]
+        # valid_mask is 1 for originals and valid hindsight slots, 0 for
+        # invalid hindsight slots; (1 - truncated) zeros out time-limit
+        # transitions.
+        mask = minibatch.extras["valid_mask"]
         loss = jnp.sum(
-            w
+            mask
             * (1.0 - minibatch.truncated)
             * (critic_update_loss + args.aux_loss_coeff * aux_loss)
-        ) / jnp.maximum((w * (1.0 - minibatch.truncated)).sum(), 1.0)
+        ) / jnp.maximum((mask * (1.0 - minibatch.truncated)).sum(), 1.0)
         return loss, dict(
             value_mse=critic_mse,
             cross_entropy_loss=critic_update_loss.mean(),
@@ -1452,8 +1445,8 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         pi = _actor_dist(params, minibatch.obs)
         old_pi = _actor_dist(actor_target_params, minibatch.obs)
 
-        w = minibatch.extras["weight"]
-        w_sum = jnp.maximum(w.sum(), 1.0)
+        mask = minibatch.extras["valid_mask"]
+        n_valid = jnp.maximum(mask.sum(), 1.0)
 
         # Per-sample KL(old_pi || pi) estimate.
         kl = compute_policy_kl(minibatch=minibatch, pi=pi, old_pi=old_pi)
@@ -1477,7 +1470,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
             per_actor_loss,
             kl * jax.lax.stop_gradient(lagrangian),
         )
-        loss = jnp.sum(w * per_sample_loss) / w_sum
+        loss = jnp.sum(mask * per_sample_loss) / n_valid
 
         # Entropy-temperature update: alpha grows when entropy drops below target.
         target_entropy = entropy - action_size_target
@@ -1487,8 +1480,8 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         # Lagrangian update: beta grows when the estimated KL exceeds kl_bound.
         lagrangian_loss = -lagrangian * jax.lax.stop_gradient(kl - args.kl_bound)
 
-        loss += jnp.sum(w * target_entropy_loss) / w_sum
-        loss += jnp.sum(w * lagrangian_loss) / w_sum
+        loss += jnp.sum(mask * target_entropy_loss) / n_valid
+        loss += jnp.sum(mask * lagrangian_loss) / n_valid
         return loss, dict(
             actor_loss=per_actor_loss.mean(),
             loss=loss.mean(),
@@ -1502,7 +1495,7 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
             entropy=entropy.mean(),
             entropy_loss=target_entropy_loss.mean(),
             target_values=minibatch.extras["target_values"].mean(),
-            valid_frac=(w > 0).astype(jnp.float32).mean(),
+            valid_frac=mask.mean(),
         )
 
     def update_critic(train_state, minibatch):
@@ -1944,14 +1937,14 @@ def train(args: Args):
         )
 
         # --- Flatten the per-iteration original slice once. ---
-        batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
+        batch.extras["valid_mask"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
         orig_flat = jax.tree_util.tree_map(
             lambda x: x.reshape((N, *x.shape[2:])), batch
         )
         orig_stripped = orig_flat.replace(
             extras={
                 "target_values": orig_flat.extras["target_values"],
-                "weight": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
+                "valid_mask": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
                 "next_emb": orig_flat.extras["next_emb"],
             }
         )
@@ -1970,7 +1963,7 @@ def train(args: Args):
                 reward_alt,
                 done_alt,
                 truncated_alt,
-                weight_alt,
+                valid_mask_alt,
                 g_alt,
                 end_idx,
             ) = her_augment(her_key, batch_raw)
@@ -2055,7 +2048,7 @@ def train(args: Args):
                 truncated=truncated_alt,
                 extras={
                     "target_values": jax.lax.stop_gradient(target_values_alt),
-                    "weight": weight_alt,
+                    "valid_mask": valid_mask_alt,
                     "next_emb": jax.lax.stop_gradient(next_emb_alt),
                 },
             )
@@ -2107,7 +2100,7 @@ def train(args: Args):
                 reward_alt,
                 done_alt,
                 truncated_alt,
-                weight_alt,
+                valid_mask_alt,
                 g_alt,
                 end_idx,
             ) = her_augment(her_key, batch)
@@ -2206,9 +2199,10 @@ def train(args: Args):
                 target_values_alt = jnp.moveaxis(target_values_alt_k, 0, 2)
                 next_emb_alt = jnp.moveaxis(next_emb_alt_k, 0, 2)
 
-            # --- 7. Build the combined batch: original (S*E rows, w=1) plus
-            #        hindsight (k*S*E rows, w = 1 or 1/m_t) flattened over time/env ---
-            batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
+            # --- 7. Build the combined batch: original (S*E rows, valid_mask=1)
+            #        plus hindsight (k*S*E rows, valid_mask = 1 for valid slots,
+            #        0 otherwise) flattened over time/env ---
+            batch.extras["valid_mask"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
             orig_flat = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
             # The behavior action is the same for every hindsight slot at a
@@ -2225,7 +2219,7 @@ def train(args: Args):
                 truncated=truncated_alt,
                 extras={
                     "target_values": jax.lax.stop_gradient(target_values_alt),
-                    "weight": weight_alt,
+                    "valid_mask": valid_mask_alt,
                     "next_emb": jax.lax.stop_gradient(next_emb_alt),
                 },
             )
@@ -2236,7 +2230,7 @@ def train(args: Args):
             orig_stripped = orig_flat.replace(
                 extras={
                     "target_values": orig_flat.extras["target_values"],
-                    "weight": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
+                    "valid_mask": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
                     "next_emb": orig_flat.extras["next_emb"],
                 }
             )
@@ -2268,7 +2262,7 @@ def train(args: Args):
         else:
             # No HER: flatten the S x E batch and run num_epochs of joint
             # critic + actor SGD on the original trajectory alone.
-            batch.extras["weight"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
+            batch.extras["valid_mask"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
             batch = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
 
             key, train_key = jax.random.split(key)
