@@ -1,11 +1,19 @@
 """
 Section order (top-to-bottom):
-  imports -> Args -> Normalizer -> AutoResetWrapper/wrap_for_training -> hl_gauss
-  -> prefix_dict/log_metrics -> networks (residual_block, Actor, Critic,
-  action_dist) -> make_env -> Transition/RolloutTransition -> HER
-  helpers -> TD-lambda helpers -> stagger helpers -> losses/epoch runners ->
-  ReppoTrainingState -> init_train_state -> collect_rollout / train_step /
-  training_epoch -> eval wiring -> checkpointing -> capture_vis -> main.
+  imports (incl. `from train import` for shared CRL scaffolding: lecun_unfirom,
+  bias_init, residual_block, Transition, load_params, save_params) -> Args
+  -> Normalizer -> AutoResetWrapper/wrap_for_training -> hl_gauss
+  -> prefix_dict/log_metrics -> networks (Actor, Critic, action_dist)
+  -> make_env -> RolloutTransition -> is_terminal -> stagger helpers
+  -> ReppoTrainingState -> train(args) [contains: env+network+optimizer setup,
+     HER helpers, TD-lambda helpers, losses + epoch runner, init_train_state,
+     collect_rollout, learner_fn, train_step, training_epoch, eval wiring,
+     checkpointing, capture_vis] -> main.
+
+All algorithm closures live inside ``train(args)`` and capture ``args``,
+``actor``, ``critic``, ``normalizer``, ``goal_indices`` etc. from its enclosing
+scope. The single exception is ``make_stagger_helpers``, which stays a top-level
+factory because the stagger code is orthogonal to the learning loop.
 """
 
 import functools
@@ -36,11 +44,18 @@ from brax.envs.base import PipelineEnv, State, Wrapper
 from brax.envs.wrappers.training import EpisodeWrapper, VmapWrapper
 from brax.io import html
 from etils import epath
-from flax.linen.initializers import variance_scaling
 from flax.training.train_state import TrainState
 from wandb_osh.hooks import TriggerWandbSyncHook
 
 from evaluator import CrlEvaluator
+from train import (
+    lecun_unfirom,
+    bias_init,
+    residual_block,
+    Transition,
+    load_params,
+    save_params,
+)
 
 
 # =============================================================================
@@ -104,9 +119,6 @@ class Args:
     aux_loss_coeff: float = 0.0
 
     # --- HER ---
-    use_her_critic: bool = False
-    use_her_actor: bool = False
-    use_her_td_lambda: bool = False
     her_k: int = 4
     her_goal_sampling: str = "uniform"   # 'uniform'|'geometric'
 
@@ -340,28 +352,6 @@ def log_metrics(time_steps: int, eval_epoch: int, metrics: dict):
 # =============================================================================
 
 
-lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
-bias_init = nn.initializers.zeros
-
-
-def residual_block(x, width, normalize, activation):
-    identity = x
-    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
-    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
-    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
-    x = nn.Dense(width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
-    x = normalize(x)
-    x = activation(x)
-    x = x + identity
-    return x
-
-
 class Actor(nn.Module):
     """
     Returns `(mean, log_std)` by default. With `deterministic=True`, returns
@@ -403,9 +393,6 @@ class Actor(nn.Module):
             activation = nn.relu
         else:
             activation = nn.swish
-
-        lecun_unfirom = variance_scaling(1 / 3, "fan_in", "uniform")
-        bias_init = nn.initializers.zeros
 
         x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
@@ -669,22 +656,11 @@ def make_env(env_id: str):
 
 
 # =============================================================================
-# Transition containers
+# RolloutTransition (Transition is imported from train.py for CRL parity)
 #
-# Transition        : NamedTuple consumed by the evaluator; carries
-#                     (observation, action, reward, discount, extras).
 # RolloutTransition : rollout-time PyTree with an extra `next_obs` field
 #                     for HER goal relabeling.
 # =============================================================================
-
-
-class Transition(NamedTuple):
-    """Evaluator-shaped transition tuple (shape matches the scaling-crl evaluator)."""
-    observation: jnp.ndarray
-    action: jnp.ndarray
-    reward: jnp.ndarray
-    discount: jnp.ndarray
-    extras: Any = ()
 
 
 class RolloutTransition(struct.PyTreeNode):
@@ -703,470 +679,15 @@ class RolloutTransition(struct.PyTreeNode):
     extras: dict
 
 
-# =============================================================================
-# HER helpers (closures over goal_indices, goal_dim, goal_reach_thresh, args).
-#
-# Achieved goals are read from `obs[..., goal_indices]` (a contiguous range
-# inside the state block, set per-env by make_env).
-#
-# replace_goal_in_obs : splice a new goal into the trailing goal_dim slots.
-# compute_goal_reward : sparse 0/1 reward = 1{ ||achieved - goal|| < thresh }.
-# her_augment         : "future" strategy - for each step t, sample k future
-#                       achieved states from the same episode segment and
-#                       return the augmented tensors.
-# td0_targets         : one-step TD(0) target r + gamma * (1 - done) * V.
-# =============================================================================
+def is_terminal(done, truncated):
+    """Return 1 only at intrinsic terminations (not time-limit truncations).
 
-
-def make_her_helpers(args: "Args", goal_indices, goal_dim: int, goal_reach_thresh: float):
-    """Factory returning (replace_goal_in_obs, compute_goal_reward, her_augment, td0_targets)."""
-
-    def replace_goal_in_obs(obs, new_goal):
-        """Replace last goal_dim dims of obs with new_goal."""
-        obs = jnp.broadcast_to(obs, new_goal.shape[:-1] + (obs.shape[-1],))
-        return obs.at[..., -goal_dim:].set(new_goal)
-
-    def compute_goal_reward(next_obs_raw, goal):
-        """Sparse reward: 1 if achieved state is within threshold of goal."""
-        achieved = next_obs_raw[..., goal_indices]
-        dist = jnp.linalg.norm(achieved - goal, axis=-1)
-        return (dist < goal_reach_thresh).astype(jnp.float32)
-
-    def her_augment(key, batch: RolloutTransition):
-        """HER 'future' strategy: sample k hindsight goals per step.
-
-        For each step t in each env, sample k indices from the remaining
-        segment [t, end_idx[t]] (up to episode boundary), and take the
-        achieved goal at each sampled step as a hindsight goal. Supports
-        uniform or geometric sampling over future offsets. Slots with fewer
-        than k available future steps are marked with valid_mask=0 and
-        truncated=1 so they are zeroed out of the critic loss.
-
-        Returns (obs_alt, next_obs_alt, reward_alt, done_alt, trunc_alt,
-                 valid_mask_alt, g_alt, end_idx).
-        """
-        S, E, k = args.num_steps, args.num_envs, args.her_k
-
-        # An episode boundary occurs when done=1 (terminal) or truncated=1.
-        boundaries = jnp.maximum(batch.done, batch.truncated)
-        step_idx = jnp.broadcast_to(jnp.arange(S)[:, None], (S, E))
-
-        # Reverse scan: end_idx[t, e] = smallest t' >= t with boundaries=1
-        # (or S-1 if no boundary before the rollout ends).
-        def scan_end(carry, x):
-            t, b = x
-            end = jnp.where(b, t, carry)
-            return end, end
-
-        _, end_idx = jax.lax.scan(
-            scan_end,
-            jnp.full((E,), S - 1, dtype=jnp.int32),
-            (step_idx, boundaries),
-            reverse=True,
-        )
-
-        # Gumbel top-k over offsets in [0, S): samples k distinct offsets
-        # without replacement, weighted by log_weights + Gumbel noise.
-        range_size = end_idx - step_idx + 1
-        offsets_range = jnp.arange(S)
-        gumbel = -jnp.log(
-            -jnp.log(jnp.clip(jax.random.uniform(key, (S, E, S)), 1e-20, 1.0 - 1e-7))
-        )
-        if args.her_goal_sampling == "geometric":
-            # Geometric weighting log_w = offset * log(gamma) biases toward
-            # near-term future steps (more weight on small offsets).
-            log_weights = offsets_range * jnp.log(args.gamma)
-        else:
-            # Uniform sampling: every future offset in the segment is equally likely.
-            log_weights = jnp.zeros(S)
-        scores = log_weights[None, None, :] + gumbel
-        # Mask out offsets that reach past the episode boundary.
-        valid_offsets = offsets_range[None, None, :] < range_size[:, :, None]
-        scores = jnp.where(valid_offsets, scores, -1e9)
-        _, top_offsets = jax.lax.top_k(scores, k)
-        future_idx = step_idx[:, :, None] + top_offsets
-
-        # A hindsight slot is valid if the segment had at least (j+1) future
-        # steps. Invalid slots are zeroed out of the loss below.
-        valid = jnp.arange(k)[None, None, :] < jnp.minimum(k, range_size)[:, :, None]
-
-        # Gather the achieved goal at each sampled future step; this is the
-        # hindsight goal for the (t, j) slot.
-        env_idx = jnp.broadcast_to(jnp.arange(E)[None, :, None], future_idx.shape)
-        g_alt = batch.next_obs[future_idx, env_idx][..., goal_indices]
-
-        # Splice g_alt into the trailing goal slots of obs and next_obs.
-        obs_alt = replace_goal_in_obs(batch.obs[:, :, None, :], g_alt)
-        next_obs_alt = replace_goal_in_obs(batch.next_obs[:, :, None, :], g_alt)
-
-        # Hindsight reward is the sparse indicator for the new goal.
-        reward_alt = compute_goal_reward(batch.next_obs[:, :, None, :], g_alt)
-
-        # term = true terminal (done & not truncated). Truncations carry
-        # through as the truncated flag below; this keeps the TD bootstrap
-        # well-defined at time-limit boundaries.
-        term = batch.done * (1.0 - batch.truncated)
-        done_alt = jnp.broadcast_to(term[:, :, None], (S, E, k))
-
-        trunc_alt = jnp.broadcast_to(batch.truncated[:, :, None], (S, E, k))
-        # Invalid slots are marked truncated=1 so (1 - truncated) zeros them in L_Q.
-        trunc_alt = jnp.where(valid, trunc_alt, 1.0)
-
-        # Validity mask: 1 for valid hindsight slots, 0 for invalid ones
-        # (which carry garbage future_idx data and must be excluded).
-        valid_mask_alt = jnp.where(valid, 1.0, 0.0)
-        return (
-            obs_alt,
-            next_obs_alt,
-            reward_alt,
-            done_alt,
-            trunc_alt,
-            valid_mask_alt,
-            g_alt,
-            end_idx,
-        )
-
-    def td0_targets(soft_reward, next_value, done):
-        """One-step TD(0) target: r_tilde + gamma * (1 - done) * V(next)."""
-        # TODO: if use_her_td_lambda=False is ever used, the gate here and the
-        # entropy mask in compute_extras_alt (L1172) both need to become
-        # (1 - done * (1 - truncated)) to correctly bootstrap at brax time-limits
-        # and include the entropy correction there. Both would need truncated_alt
-        # threaded through compute_extras_alt's signature. Currently unreachable
-        # under the slurm config (use_her_td_lambda=True) so deferred.
-        return soft_reward + args.gamma * (1.0 - done) * next_value
-
-    return replace_goal_in_obs, compute_goal_reward, her_augment, td0_targets
-
-
-# =============================================================================
-# TD-lambda target helpers (closures over args, actor, critic, normalizer,
-# goal_indices, goal_reach_thresh, replace_goal_in_obs, fusion_dim).
-#
-# nstep_lambda                    : reverse-scan TD-lambda return on the
-#                                   original trajectory.
-# compute_extras                  : for the original trajectory, compute the
-#                                   max-entropy soft reward
-#                                      r - gamma * alpha * log pi(a_{t+1})
-#                                   and V(next) averaged over
-#                                   num_action_samples samples from
-#                                   pi(. | next_obs).
-# compute_extras_alt              : same as above but for a hindsight
-#                                   trajectory with fresh actions sampled
-#                                   under the alt goal.
-# compute_alt_td_lambda_targets_k : IS-corrected TD-lambda target for one
-#                                   k-slot of hindsight goals, built in a
-#                                   single reverse scan (see inline comments
-#                                   for the per-decision ratio rho and the
-#                                   interior / boundary recursions).
-# =============================================================================
-
-
-def make_td_lambda_helpers(
-    args: "Args",
-    actor: "Actor",
-    critic: "Critic",
-    normalizer: Normalizer,
-    goal_indices,
-    goal_reach_thresh: float,
-    replace_goal_in_obs,
-    fusion_dim: int = 256,
-):
-    """Factory returning (nstep_lambda, compute_extras, compute_extras_alt,
-    compute_alt_td_lambda_targets_k)."""
-
-    def _actor_dist(params, obs):
-        mean, log_std = actor.apply(params, obs)
-        return action_dist(mean, log_std)
-
-    def _alpha(actor_params):
-        return jnp.exp(actor_params["params"]["log_temperature"])
-
-    def nstep_lambda(batch):
-        """Reverse-scan TD-lambda return using the max-entropy soft reward."""
-        def loop(returns, transition):
-            done = transition.done
-            reward = transition.extras["soft_reward"]
-            next_value = transition.extras["next_value"]
-            truncated = transition.truncated
-            # Lambda mixes the upstream return (lambda) with the bootstrap
-            # V(next) (1 - lambda). lambda=1 recovers the Monte-Carlo
-            # return; lambda=0 recovers TD(0).
-            lambda_sum = args.lmbda * returns + (1 - args.lmbda) * next_value
-            # At a truncation (time-limit): bootstrap only.
-            # Otherwise: r_tilde + gamma * (1 - done) * lambda_sum.
-            lambda_return = reward + args.gamma * jnp.where(
-                truncated, next_value, (1.0 - done) * lambda_sum
-            )
-            return lambda_return, lambda_return
-
-        # Reverse scan across time. init = V(next) at the last rollout step,
-        # so the final step's target is r_tilde + gamma * V(next).
-        _, lambda_return = jax.lax.scan(
-            f=loop,
-            init=batch.extras["next_value"][-1],
-            xs=batch,
-            reverse=True,
-        )
-        return lambda_return
-
-    def compute_extras(key, train_state, batch):
-        """Compute max-entropy soft reward and V(next) for the original trajectory."""
-        actor_params = train_state.actor_state.params
-        critic_params = train_state.critic_state.params
-        alpha = _alpha(actor_params)
-
-        # Next-action distribution evaluated at next_obs. Used twice below.
-        key, next_act_key = jax.random.split(key)
-        next_pi = _actor_dist(actor_params, batch.next_obs)
-        next_action = next_pi.sample(seed=next_act_key)
-        # At episode boundaries (done or truncated), batch.action[t+1] is
-        # from a new episode, so fall back to a fresh sample. Otherwise
-        # use the action actually executed at t+1 in the rollout.
-        boundary_mask = jnp.maximum(batch.truncated, batch.done)
-        true_next_action = jnp.where(
-            boundary_mask[..., None],
-            next_action,
-            jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
-        )
-        true_next_action = jnp.clip(true_next_action, -1 + 1e-4, 1 - 1e-4)
-        true_next_log_prob = next_pi.log_prob(true_next_action)
-        # Max-entropy soft reward: r_t - gamma * (1 - intrinsic_done) * alpha * log pi(a_{t+1}).
-        # Under brax's EpisodeWrapper convention, done=1 fires at BOTH intrinsic
-        # terminations and time-limits; truncated=1 disambiguates the time-limit
-        # case. The "truly absorbing state" flag is thus done * (1 - truncated).
-        # Matches the nstep_lambda bootstrap gate `jnp.where(truncated, V, (1-done)*V)`.
-        intrinsic_done = batch.done * (1.0 - batch.truncated)
-        soft_reward = batch.reward - args.gamma * (1.0 - intrinsic_done) * true_next_log_prob * alpha
-
-        # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
-        # estimated with num_action_samples draws to reduce variance.
-        key, next_act_key = jax.random.split(key)
-        next_sample_actions = next_pi.sample(
-            seed=next_act_key, sample_shape=(args.num_action_samples,)
-        )
-        next_critic_output = critic.apply(
-            critic_params,
-            jnp.repeat(batch.next_obs[None, ...], args.num_action_samples, axis=0),
-            next_sample_actions,
-        )
-        next_values = next_critic_output["value"].mean(0)
-        # next_emb is used as the stop-grad target for the critic's
-        # auxiliary next-embedding prediction head.
-        next_emb = next_critic_output["embed"][0]
-
-        return {
-            "soft_reward": soft_reward,
-            "next_value": next_values,
-            "next_emb": jax.lax.stop_gradient(next_emb),
-        }
-
-    def compute_extras_alt(key, train_state, obs_alt, next_obs_alt, reward_alt, done_alt):
-        """Soft reward and V(next) for a hindsight trajectory under g_alt.
-
-        The rollout action at t+1 was executed under the original goal, not
-        under g_alt, so we always sample a fresh action from pi(. | x_{t+1},
-        g_alt) for both the max-entropy correction and the V(next) estimate.
-        """
-        actor_params = train_state.actor_state.params
-        critic_params = train_state.critic_state.params
-        alpha = _alpha(actor_params)
-
-        # Fresh action under the alt goal. Used for both the log-prob
-        # correction and the V(next) estimate below.
-        key, next_act_key = jax.random.split(key)
-        next_pi = _actor_dist(actor_params, next_obs_alt)
-        next_action = next_pi.sample(seed=next_act_key)
-        next_action = jnp.clip(next_action, -1 + 1e-4, 1 - 1e-4)
-        next_log_prob = next_pi.log_prob(next_action)
-        # Max-entropy soft reward using the fresh action's log-prob.
-        # Gated by (1 - done_alt) to match td0_targets (which also uses just
-        # (1 - done) on the bootstrap). See td0_targets TODO re: brax time-limits.
-        soft_reward = reward_alt - args.gamma * (1.0 - done_alt) * next_log_prob * alpha
-
-        # V(next) averaged over num_action_samples draws from pi(.|x, g_alt).
-        key, next_act_key = jax.random.split(key)
-        next_sample_actions = next_pi.sample(
-            seed=next_act_key, sample_shape=(args.num_action_samples,)
-        )
-        next_critic_output = critic.apply(
-            critic_params,
-            jnp.repeat(next_obs_alt[None, ...], args.num_action_samples, axis=0),
-            next_sample_actions,
-        )
-        next_values = next_critic_output["value"].mean(0)
-        next_emb = next_critic_output["embed"][0]
-
-        return {
-            "soft_reward": soft_reward,
-            "next_value": next_values,
-            "next_emb": jax.lax.stop_gradient(next_emb),
-        }
-
-    def compute_alt_td_lambda_targets_k(
-        key, train_state, batch_raw, norm_state, g_alt_k, end_idx,
-    ):
-        """IS-corrected TD-lambda targets for one slot of hindsight goals.
-
-        For each starting time t and each env, the target G_t^{alt} is built
-        over the remainder of the same episode segment [t, end_idx[t]] with:
-          * reward_u = 1{ ||achieved(next_obs_u) - g_alt|| < thresh }
-          * soft reward subtracts gamma * alpha * log pi under g_alt
-          * per-decision IS ratio
-              rho_{u+1} = min(1, pi(a_{u+1} | x_{u+1}, g_alt)
-                              / pi(a_{u+1} | x_{u+1}, g_orig))
-            corrects for the action mismatch between g_alt and g_orig
-          * at u = end_idx[t]: bootstrap only (truncation case uses V,
-            otherwise (1-term)*V)
-          * at u < end_idx[t] (interior):
-              G_u = r_tilde_u + gamma * (1 - term_u)
-                    * ((1 - lambda * rho) * V_u + lambda * rho * G_{u+1})
-
-        Implemented as a single reverse scan over u so peak memory is O(S*E)
-        rather than the O(S^2*E) of a naive per-t inner loop.
-
-        Returns (stop_grad(G_final), mean_rho, stop_grad(next_emb_final)).
-        """
-        S, E = args.num_steps, args.num_envs
-        actor_params = train_state.actor_state.params
-        critic_params = train_state.critic_state.params
-        alpha = jax.lax.stop_gradient(_alpha(actor_params))
-
-        # Log-prob of each rolled-out action under the frozen behavior
-        # policy evaluated at the original goal. Denominator of the IS ratio.
-        norm_obs = normalizer.normalize(norm_state, batch_raw.obs)
-        orig_pi = _actor_dist(actor_params, norm_obs)
-        orig_log_probs = orig_pi.log_prob(
-            jnp.clip(batch_raw.action, -1 + 1e-4, 1 - 1e-4)
-        )
-
-        t_idx = jnp.arange(S)[:, None]
-
-        def scan_step(carry, u):
-            """Process step u once; update G at every t that covers u."""
-            G, rng, rho_sum, rho_count, next_emb_acc = carry
-            rng, act_key = jax.random.split(rng)
-
-            # Build next_obs with g_alt spliced in, then normalize it so
-            # the networks receive properly-scaled inputs.
-            raw_next = batch_raw.next_obs[u]
-            raw_next_exp = jnp.broadcast_to(
-                raw_next[None, :, :], (S, E, raw_next.shape[-1])
-            )
-            obs_alt_u = replace_goal_in_obs(raw_next_exp, g_alt_k)
-            obs_alt_u = normalizer.normalize(norm_state, obs_alt_u)
-
-            # Fresh action a' ~ pi(. | x_{u+1}, g_alt). Used for V_u and
-            # for the boundary max-entropy correction.
-            pi_alt = _actor_dist(actor_params, obs_alt_u)
-            fresh_action = pi_alt.sample(seed=act_key)
-            fresh_action = jnp.clip(fresh_action, -1 + 1e-4, 1 - 1e-4)
-            fresh_log_prob = pi_alt.log_prob(fresh_action)
-
-            # Rolled-out action at step u+1 (clamped to the open interval to
-            # keep the tanh-Gaussian log-prob finite). Numerator of the IS
-            # ratio is evaluated at this action.
-            a_next = batch_raw.action[jnp.minimum(u + 1, S - 1)]
-            a_next_clipped = jnp.clip(a_next, -1 + 1e-4, 1 - 1e-4)
-            a_next_exp = jnp.broadcast_to(
-                a_next_clipped[None, :, :], (S, E, a_next.shape[-1])
-            )
-            is_num_log = pi_alt.log_prob(a_next_exp)
-
-            # Q(next_obs_alt, a') and the fused embedding at step u.
-            critic_out = critic.apply(critic_params, obs_alt_u, fresh_action)
-            V_u = critic_out["value"]
-            embed_u = critic_out["embed"]
-
-            # Hindsight reward at step u: 1 if the achieved state at u+1
-            # is within threshold of g_alt, else 0.
-            achieved = raw_next[:, goal_indices]
-            dist = jnp.linalg.norm(achieved[None, :, :] - g_alt_k, axis=-1)
-            reward_u = (dist < goal_reach_thresh).astype(jnp.float32)
-
-            # Per-decision IS ratio, clipped at 1 for variance reduction.
-            #   rho = min(1, pi(a_{u+1}|x_{u+1}, g_alt)
-            #              / pi(a_{u+1}|x_{u+1}, g_orig))
-            is_denom = orig_log_probs[jnp.minimum(u + 1, S - 1)]
-            log_rho = is_num_log - is_denom[None, :]
-            rho = jnp.minimum(1.0, jnp.exp(log_rho))
-
-            # Terminal flags for step u. Under brax's EpisodeWrapper, done=1
-            # fires at both intrinsic terminations and time-limits; truncated=1
-            # disambiguates the time-limit case. term_mask zeros the entropy
-            # correction ONLY at intrinsic terminations (done=1, truncated=0),
-            # matching the jnp.where(trunc, V, (1-term)*V) bootstrap gate below.
-            term_u = batch_raw.done[u]
-            trunc_u = batch_raw.truncated[u]
-            term_mask = 1.0 - term_u[None, :] * (1.0 - trunc_u[None, :])
-
-            # Max-entropy correction at every step uses a fresh action sampled
-            # under g_alt:
-            #   r_tilde_u = r_u - gamma * (1 - term_u*(1-trunc_u)) * e^alpha
-            #                         * log pi(a'_{u+1} | x_{u+1}, g_alt).
-            soft_r = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
-
-            # For each t, u is the segment boundary if u == end_idx[t, e],
-            # and is an interior step if t <= u < end_idx[t, e].
-            end = end_idx
-            is_boundary = (u == end)
-            is_interior = (t_idx <= u) & (u < end)
-
-            # Track the mean clipped IS ratio over interior ticks (logged).
-            rho_sum = rho_sum + jnp.sum(rho * is_interior)
-            rho_count = rho_count + jnp.sum(is_interior.astype(rho.dtype))
-
-            # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
-            G_bnd = soft_r + args.gamma * jnp.where(
-                trunc_u[None, :], V_u, (1.0 - term_u[None, :]) * V_u
-            )
-            # Interior target: r_tilde + gamma * (1 - term)
-            #                           * ((1 - lambda*rho)*V + lambda*rho*G).
-            G_int = soft_r + args.gamma * jnp.where(
-                trunc_u[None, :],
-                V_u,
-                (1.0 - term_u[None, :])
-                * ((1.0 - args.lmbda * rho) * V_u + args.lmbda * rho * G),
-            )
-
-            G_new = jnp.where(
-                is_boundary, G_bnd, jnp.where(is_interior, G_int, G)
-            )
-
-            # Save the fused embedding for the critic's auxiliary target,
-            # but only at the original step u == t.
-            write_emb = (u == t_idx)[..., None]
-            next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
-
-            return (G_new, rng, rho_sum, rho_count, next_emb_acc), None
-
-        # Reverse scan across u from S-1 down to 0 so G at the interior
-        # recursion always sees the already-updated G_{u+1}.
-        (G_final, _, rho_sum, rho_count, next_emb_final), _ = jax.lax.scan(
-            scan_step,
-            (
-                jnp.zeros((S, E)),
-                key,
-                jnp.float32(0.0),
-                jnp.float32(0.0),
-                jnp.zeros((S, E, fusion_dim)),
-            ),
-            jnp.arange(S),
-            reverse=True,
-        )
-        mean_rho = rho_sum / jnp.maximum(rho_count, 1.0)
-        return (
-            jax.lax.stop_gradient(G_final),
-            mean_rho,
-            jax.lax.stop_gradient(next_emb_final),
-        )
-
-    return (
-        nstep_lambda,
-        compute_extras,
-        compute_extras_alt,
-        compute_alt_td_lambda_targets_k,
-    )
+    Brax's EpisodeWrapper sets done=1 at BOTH intrinsic terminations and
+    time-limit truncations; truncated=1 disambiguates the time-limit case.
+    The bootstrap gate ``(1 - is_terminal)`` matches the ``(1 - term_t)``
+    factor in the v6 pseudocode.
+    """
+    return done * (1.0 - truncated)
 
 
 # =============================================================================
@@ -1372,17 +893,486 @@ def make_stagger_helpers(args: "Args", env):
 
 
 # =============================================================================
-# Losses + epoch runners
+# Training state + checkpoint I/O
 # =============================================================================
 
 
-def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: int):
-    """Factory returning (critic_loss, actor_loss, compute_policy_kl,
-    update_critic, update_actor, run_epoch, run_epoch_separate)."""
+@flax.struct.dataclass
+class ReppoTrainingState:
+    """Training state: networks, optimizer state, RMS stats, and last env state."""
+    env_steps: jnp.ndarray
+    iteration: jnp.ndarray
+    actor_state: TrainState
+    critic_state: TrainState
+    actor_target_params: Any
+    normalization_state: NormalizationState
+    last_env_state: State
+
+
+# =============================================================================
+# Training driver
+#
+# train(args): end-to-end trainer. Builds env, networks, normalizer,
+# optimizers and helper closures, then runs an eval-interleaved outer loop:
+#
+#     for eval_epoch in range(num_evals):
+#         training_epoch       # jit-scanned train_step over eval_interval iters
+#         evaluator.run_evaluation
+#         log + checkpoint
+#
+# Each train_step = one rollout + one learner_fn call (N_epochs of SGD
+# over the collected batch).
+# =============================================================================
+
+
+def train(args: Args):
+    assert (args.num_steps * args.num_envs) % args.num_mini_batches == 0, (
+        f"num_steps*num_envs ({args.num_steps * args.num_envs}) must be "
+        f"divisible by num_mini_batches ({args.num_mini_batches})"
+    )
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
+    # --- Env + eval env ---------------------------------------------------
+    env_raw, obs_dim, goal_start_idx, goal_end_idx, success_thresh = make_env(args.env_id)
+    args.obs_dim = obs_dim
+    args.goal_start_idx = goal_start_idx
+    args.goal_end_idx = goal_end_idx
+    args.success_thresh = success_thresh
+    goal_dim = goal_end_idx - goal_start_idx
+    goal_indices = jnp.arange(goal_start_idx, goal_end_idx)
+    goal_reach_thresh = success_thresh
+
+    env = wrap_for_training(
+        env_raw,
+        episode_length=args.episode_length,
+        action_repeat=args.action_repeat,
+    )
+
+    eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
+    eval_env_raw, _, _, _, _ = make_env(eval_env_id)
+    eval_env = envs.training.wrap(eval_env_raw, episode_length=args.episode_length)
+
+    obs_size = env.observation_size
+    action_size = env.action_size
+    print(f"obs_size: {obs_size}, action_size: {action_size}", flush=True)
+    print(
+        f"obs_dim: {args.obs_dim}, "
+        f"goal_start_idx: {args.goal_start_idx}, goal_end_idx: {args.goal_end_idx}, "
+        f"success_thresh: {args.success_thresh}",
+        flush=True,
+    )
+
+    # --- Networks + normalizer -------------------------------------------
+    normalizer = Normalizer()
+    actor = Actor(
+        action_size=action_size,
+        network_width=args.actor_network_width,
+        network_depth=args.actor_depth,
+        skip_connections=args.actor_skip_connections,
+        use_relu=args.use_relu,
+        kl_start=args.kl_start,
+        ent_start=args.ent_start,
+    )
+    critic = Critic(
+        action_size=action_size,
+        network_width=args.critic_network_width,
+        network_depth=args.critic_depth,
+        skip_connections=args.critic_skip_connections,
+        use_relu=args.use_relu,
+        num_bins=args.num_bins,
+        vmin=args.vmin,
+        vmax=args.vmax,
+    )
+
+    # --- Optimizers -------------------------------------------------------
+    if args.anneal_lr:
+        actor_lr = optax.linear_schedule(
+            init_value=args.actor_lr,
+            end_value=0.0,
+            transition_steps=args.total_time_steps,
+        )
+        critic_lr = optax.linear_schedule(
+            init_value=args.critic_lr,
+            end_value=0.0,
+            transition_steps=args.total_time_steps,
+        )
+    else:
+        actor_lr = args.actor_lr
+        critic_lr = args.critic_lr
+    actor_opt = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm), optax.adam(actor_lr)
+    )
+    critic_opt = optax.chain(
+        optax.clip_by_global_norm(args.max_grad_norm), optax.adam(critic_lr)
+    )
+
+    # === HER helpers ===
+    # Achieved goals are read from `obs[..., goal_indices]` (a contiguous range
+    # set per-env by make_env). All three closures capture `args`, `goal_indices`,
+    # `goal_dim`, `goal_reach_thresh` from the surrounding `train` scope.
+
+    def replace_goal_in_obs(obs, new_goal):
+        """Replace last goal_dim dims of obs with new_goal."""
+        obs = jnp.broadcast_to(obs, new_goal.shape[:-1] + (obs.shape[-1],))
+        return obs.at[..., -goal_dim:].set(new_goal)
+
+    def compute_goal_reward(next_obs_raw, goal):
+        """Sparse reward: 1 if achieved state is within threshold of goal."""
+        achieved = next_obs_raw[..., goal_indices]
+        dist = jnp.linalg.norm(achieved - goal, axis=-1)
+        return (dist < goal_reach_thresh).astype(jnp.float32)
+
+    def her_augment(key, batch: RolloutTransition):
+        """HER 'future' strategy: sample k hindsight goals per step.
+
+        For each step t in each env, sample k indices from the remaining
+        segment [t, end_idx[t]] (up to episode boundary), and take the
+        achieved goal at each sampled step as a hindsight goal. Supports
+        uniform or geometric sampling over future offsets. Slots with fewer
+        than k available future steps are marked with valid_mask=0 and
+        truncated=1 so they are zeroed out of the critic loss.
+
+        Returns (obs_alt, next_obs_alt, reward_alt, done_alt, trunc_alt,
+                 valid_mask_alt, g_alt, end_idx).
+        """
+        S, E, k = args.num_steps, args.num_envs, args.her_k
+
+        # An episode boundary occurs when done=1 (terminal) or truncated=1.
+        boundaries = jnp.maximum(batch.done, batch.truncated)
+        step_idx = jnp.broadcast_to(jnp.arange(S)[:, None], (S, E))
+
+        # Reverse scan: end_idx[t, e] = smallest t' >= t with boundaries=1
+        # (or S-1 if no boundary before the rollout ends).
+        def scan_end(carry, x):
+            t, b = x
+            end = jnp.where(b, t, carry)
+            return end, end
+
+        _, end_idx = jax.lax.scan(
+            scan_end,
+            jnp.full((E,), S - 1, dtype=jnp.int32),
+            (step_idx, boundaries),
+            reverse=True,
+        )
+
+        # Gumbel top-k over offsets in [0, S): samples k distinct offsets
+        # without replacement, weighted by log_weights + Gumbel noise.
+        range_size = end_idx - step_idx + 1
+        offsets_range = jnp.arange(S)
+        gumbel = -jnp.log(
+            -jnp.log(jnp.clip(jax.random.uniform(key, (S, E, S)), 1e-20, 1.0 - 1e-7))
+        )
+        if args.her_goal_sampling == "geometric":
+            # Geometric weighting log_w = offset * log(gamma) biases toward
+            # near-term future steps (more weight on small offsets).
+            log_weights = offsets_range * jnp.log(args.gamma)
+        else:
+            # Uniform sampling: every future offset in the segment is equally likely.
+            log_weights = jnp.zeros(S)
+        scores = log_weights[None, None, :] + gumbel
+        # Mask out offsets that reach past the episode boundary.
+        valid_offsets = offsets_range[None, None, :] < range_size[:, :, None]
+        scores = jnp.where(valid_offsets, scores, -1e9)
+        _, top_offsets = jax.lax.top_k(scores, k)
+        future_idx = step_idx[:, :, None] + top_offsets
+
+        # A hindsight slot is valid if the segment had at least (j+1) future
+        # steps. Invalid slots are zeroed out of the loss below.
+        valid = jnp.arange(k)[None, None, :] < jnp.minimum(k, range_size)[:, :, None]
+
+        # Gather the achieved goal at each sampled future step; this is the
+        # hindsight goal for the (t, j) slot.
+        env_idx = jnp.broadcast_to(jnp.arange(E)[None, :, None], future_idx.shape)
+        g_alt = batch.next_obs[future_idx, env_idx][..., goal_indices]
+
+        # Splice g_alt into the trailing goal slots of obs and next_obs.
+        obs_alt = replace_goal_in_obs(batch.obs[:, :, None, :], g_alt)
+        next_obs_alt = replace_goal_in_obs(batch.next_obs[:, :, None, :], g_alt)
+
+        # Hindsight reward is the sparse indicator for the new goal.
+        reward_alt = compute_goal_reward(batch.next_obs[:, :, None, :], g_alt)
+
+        # term marks intrinsic terminations only; time-limit truncations
+        # carry through as the truncated flag below so the TD bootstrap
+        # stays well-defined at time-limit boundaries.
+        term = is_terminal(batch.done, batch.truncated)
+        done_alt = jnp.broadcast_to(term[:, :, None], (S, E, k))
+
+        trunc_alt = jnp.broadcast_to(batch.truncated[:, :, None], (S, E, k))
+        # Invalid slots are marked truncated=1 so (1 - truncated) zeros them in L_Q.
+        trunc_alt = jnp.where(valid, trunc_alt, 1.0)
+
+        # Validity mask: 1 for valid hindsight slots, 0 for invalid ones
+        # (which carry garbage future_idx data and must be excluded).
+        valid_mask_alt = jnp.where(valid, 1.0, 0.0)
+        return (
+            obs_alt,
+            next_obs_alt,
+            reward_alt,
+            done_alt,
+            trunc_alt,
+            valid_mask_alt,
+            g_alt,
+            end_idx,
+        )
+
+    # === TD-lambda target helpers ===
+    # nstep_lambda      : reverse-scan TD-lambda return on the original
+    #                     trajectory.
+    # compute_extras    : for the original trajectory, compute the max-entropy
+    #                     soft reward and V(next).
+    # compute_alt_target: IS-corrected TD-lambda target for ONE hindsight slot
+    #                     j, built in a single reverse scan over the segment
+    #                     [t, e(t)]. The outer scan over j is at the call site
+    #                     in learner_fn.
+
+    fusion_dim = args.critic_network_width
 
     def _actor_dist(params, obs):
         mean, log_std = actor.apply(params, obs)
         return action_dist(mean, log_std)
+
+    def _alpha(actor_params):
+        return jnp.exp(actor_params["params"]["log_temperature"])
+
+    def nstep_lambda(batch):
+        """Reverse-scan TD-lambda return using the max-entropy soft reward."""
+        def loop(returns, transition):
+            done = transition.done
+            reward = transition.extras["soft_reward"]
+            next_value = transition.extras["next_value"]
+            truncated = transition.truncated
+            # Lambda mixes the upstream return (lambda) with the bootstrap
+            # V(next) (1 - lambda). lambda=1 recovers the Monte-Carlo
+            # return; lambda=0 recovers TD(0).
+            lambda_sum = args.lmbda * returns + (1 - args.lmbda) * next_value
+            # At a truncation (time-limit): bootstrap only.
+            # Otherwise: r_tilde + gamma * (1 - done) * lambda_sum.
+            lambda_return = reward + args.gamma * jnp.where(
+                truncated, next_value, (1.0 - done) * lambda_sum
+            )
+            return lambda_return, lambda_return
+
+        # Reverse scan across time. init = V(next) at the last rollout step,
+        # so the final step's target is r_tilde + gamma * V(next).
+        _, lambda_return = jax.lax.scan(
+            f=loop,
+            init=batch.extras["next_value"][-1],
+            xs=batch,
+            reverse=True,
+        )
+        return lambda_return
+
+    def compute_extras(key, train_state, batch):
+        """Compute max-entropy soft reward and V(next) for the original trajectory."""
+        actor_params = train_state.actor_state.params
+        critic_params = train_state.critic_state.params
+        alpha = _alpha(actor_params)
+
+        # Next-action distribution evaluated at next_obs. Used twice below.
+        key, next_act_key = jax.random.split(key)
+        next_pi = _actor_dist(actor_params, batch.next_obs)
+        next_action = next_pi.sample(seed=next_act_key)
+        # At episode boundaries (done or truncated), batch.action[t+1] is
+        # from a new episode, so fall back to a fresh sample. Otherwise
+        # use the action actually executed at t+1 in the rollout.
+        boundary_mask = jnp.maximum(batch.truncated, batch.done)
+        true_next_action = jnp.where(
+            boundary_mask[..., None],
+            next_action,
+            jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
+        )
+        true_next_action = jnp.clip(true_next_action, -1 + 1e-4, 1 - 1e-4)
+        true_next_log_prob = next_pi.log_prob(true_next_action)
+        # Max-entropy soft reward: r_t - gamma * (1 - is_terminal) * alpha * log pi(a_{t+1}).
+        # is_terminal zeros the entropy bonus only at intrinsic terminations,
+        # matching the nstep_lambda bootstrap gate `jnp.where(truncated, V, (1-done)*V)`.
+        terminal = is_terminal(batch.done, batch.truncated)
+        soft_reward = batch.reward - args.gamma * (1.0 - terminal) * true_next_log_prob * alpha
+
+        # V(next) = E_{a' ~ pi(.|next_obs)} Q(next_obs, a'), Monte-Carlo
+        # estimated with num_action_samples draws to reduce variance.
+        key, next_act_key = jax.random.split(key)
+        next_sample_actions = next_pi.sample(
+            seed=next_act_key, sample_shape=(args.num_action_samples,)
+        )
+        next_critic_output = critic.apply(
+            critic_params,
+            jnp.repeat(batch.next_obs[None, ...], args.num_action_samples, axis=0),
+            next_sample_actions,
+        )
+        next_values = next_critic_output["value"].mean(0)
+        # next_emb is used as the stop-grad target for the critic's
+        # auxiliary next-embedding prediction head.
+        next_emb = next_critic_output["embed"][0]
+
+        return {
+            "soft_reward": soft_reward,
+            "next_value": next_values,
+            "next_emb": jax.lax.stop_gradient(next_emb),
+        }
+
+    def compute_alt_target(
+        key, train_state,
+        raw_obs, raw_action, raw_next_obs, raw_done, raw_truncated,
+        norm_state, g_alt, end_idx,
+    ):
+        """IS-corrected TD-lambda target for ONE hindsight slot j.
+
+        For each starting time t and each env, the target G_t^{alt,j} is built
+        over the remainder of the same episode segment [t, end_idx[t]] with:
+          * reward_u = 1{ ||achieved(next_obs_u) - g_alt|| < thresh }
+          * soft reward subtracts gamma * alpha * log pi under g_alt
+          * per-decision IS ratio
+              rho_{u+1} = min(1, pi(a_{u+1} | x_{u+1}, g_alt)
+                              / pi(a_{u+1} | x_{u+1}, g_orig))
+            corrects for the action mismatch between g_alt and g_orig
+          * at u = end_idx[t]: bootstrap only (truncation case uses V,
+            otherwise (1-term)*V)
+          * at u < end_idx[t] (interior):
+              G_u = r_tilde_u + gamma * (1 - term_u)
+                    * ((1 - lambda * rho) * V_u + lambda * rho * G_{u+1})
+
+        Implemented as a single reverse scan over u so peak memory is O(S*E)
+        rather than the O(S^2*E) of a naive per-t inner loop.
+
+        Returns (stop_grad(G_final), mean_rho, stop_grad(next_emb_final)).
+        """
+        S, E = args.num_steps, args.num_envs
+        actor_params = train_state.actor_state.params
+        critic_params = train_state.critic_state.params
+        alpha = jax.lax.stop_gradient(_alpha(actor_params))
+
+        # Log-prob of each rolled-out action under the frozen behavior
+        # policy evaluated at the original goal. Denominator of the IS ratio.
+        norm_obs = normalizer.normalize(norm_state, raw_obs)
+        orig_pi = _actor_dist(actor_params, norm_obs)
+        orig_log_probs = orig_pi.log_prob(
+            jnp.clip(raw_action, -1 + 1e-4, 1 - 1e-4)
+        )
+
+        t_idx = jnp.arange(S)[:, None]
+
+        def scan_step(carry, u):
+            """Process step u once; update G at every t that covers u."""
+            G, rng, rho_sum, rho_count, next_emb_acc = carry
+            rng, act_key = jax.random.split(rng)
+
+            # Build next_obs with g_alt spliced in, then normalize it so
+            # the networks receive properly-scaled inputs.
+            raw_next = raw_next_obs[u]
+            raw_next_exp = jnp.broadcast_to(
+                raw_next[None, :, :], (S, E, raw_next.shape[-1])
+            )
+            obs_alt_u = replace_goal_in_obs(raw_next_exp, g_alt)
+            obs_alt_u = normalizer.normalize(norm_state, obs_alt_u)
+
+            # Fresh action a' ~ pi(. | x_{u+1}, g_alt). Used for V_u and
+            # for the boundary max-entropy correction.
+            pi_alt = _actor_dist(actor_params, obs_alt_u)
+            fresh_action = pi_alt.sample(seed=act_key)
+            fresh_action = jnp.clip(fresh_action, -1 + 1e-4, 1 - 1e-4)
+            fresh_log_prob = pi_alt.log_prob(fresh_action)
+
+            # Rolled-out action at step u+1 (clamped to the open interval to
+            # keep the tanh-Gaussian log-prob finite). Numerator of the IS
+            # ratio is evaluated at this action.
+            a_next = raw_action[jnp.minimum(u + 1, S - 1)]
+            a_next_clipped = jnp.clip(a_next, -1 + 1e-4, 1 - 1e-4)
+            a_next_exp = jnp.broadcast_to(
+                a_next_clipped[None, :, :], (S, E, a_next.shape[-1])
+            )
+            is_num_log = pi_alt.log_prob(a_next_exp)
+
+            # Q(next_obs_alt, a') and the fused embedding at step u.
+            critic_out = critic.apply(critic_params, obs_alt_u, fresh_action)
+            V_u = critic_out["value"]
+            embed_u = critic_out["embed"]
+
+            # Hindsight reward at step u: 1 if the achieved state at u+1
+            # is within threshold of g_alt, else 0.
+            achieved = raw_next[:, goal_indices]
+            dist = jnp.linalg.norm(achieved[None, :, :] - g_alt, axis=-1)
+            reward_u = (dist < goal_reach_thresh).astype(jnp.float32)
+
+            # Per-decision IS ratio, clipped at 1 for variance reduction.
+            #   rho = min(1, pi(a_{u+1}|x_{u+1}, g_alt)
+            #              / pi(a_{u+1}|x_{u+1}, g_orig))
+            is_denom = orig_log_probs[jnp.minimum(u + 1, S - 1)]
+            log_rho = is_num_log - is_denom[None, :]
+            rho = jnp.minimum(1.0, jnp.exp(log_rho))
+
+            # Terminal flags for step u. is_terminal zeros the entropy
+            # correction ONLY at intrinsic terminations, matching the
+            # jnp.where(trunc, V, (1-term)*V) bootstrap gate below.
+            term_u = raw_done[u]
+            trunc_u = raw_truncated[u]
+            term_mask = 1.0 - is_terminal(term_u, trunc_u)[None, :]
+
+            # Max-entropy correction at every step uses a fresh action sampled
+            # under g_alt:
+            #   r_tilde_u = r_u - gamma * (1 - term_u*(1-trunc_u)) * e^alpha
+            #                         * log pi(a'_{u+1} | x_{u+1}, g_alt).
+            soft_r = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
+
+            # For each t, u is the segment boundary if u == end_idx[t, e],
+            # and is an interior step if t <= u < end_idx[t, e].
+            end = end_idx
+            is_boundary = (u == end)
+            is_interior = (t_idx <= u) & (u < end)
+
+            # Track the mean clipped IS ratio over interior ticks (logged).
+            rho_sum = rho_sum + jnp.sum(rho * is_interior)
+            rho_count = rho_count + jnp.sum(is_interior.astype(rho.dtype))
+
+            # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
+            G_bnd = soft_r + args.gamma * jnp.where(
+                trunc_u[None, :], V_u, (1.0 - term_u[None, :]) * V_u
+            )
+            # Interior target: r_tilde + gamma * (1 - term)
+            #                           * ((1 - lambda*rho)*V + lambda*rho*G).
+            G_int = soft_r + args.gamma * jnp.where(
+                trunc_u[None, :],
+                V_u,
+                (1.0 - term_u[None, :])
+                * ((1.0 - args.lmbda * rho) * V_u + args.lmbda * rho * G),
+            )
+
+            G_new = jnp.where(
+                is_boundary, G_bnd, jnp.where(is_interior, G_int, G)
+            )
+
+            # Save the fused embedding for the critic's auxiliary target,
+            # but only at the original step u == t.
+            write_emb = (u == t_idx)[..., None]
+            next_emb_acc = jnp.where(write_emb, embed_u, next_emb_acc)
+
+            return (G_new, rng, rho_sum, rho_count, next_emb_acc), None
+
+        # Reverse scan across u from S-1 down to 0 so G at the interior
+        # recursion always sees the already-updated G_{u+1}.
+        (G_final, _, rho_sum, rho_count, next_emb_final), _ = jax.lax.scan(
+            scan_step,
+            (
+                jnp.zeros((S, E)),
+                key,
+                jnp.float32(0.0),
+                jnp.float32(0.0),
+                jnp.zeros((S, E, fusion_dim)),
+            ),
+            jnp.arange(S),
+            reverse=True,
+        )
+        mean_rho = rho_sum / jnp.maximum(rho_count, 1.0)
+        return (
+            jax.lax.stop_gradient(G_final),
+            mean_rho,
+            jax.lax.stop_gradient(next_emb_final),
+        )
+
+    # === Losses + epoch runner ===
 
     def critic_loss(params, train_state, minibatch):
         """HL-Gauss categorical cross-entropy loss plus next-emb / reward aux."""
@@ -1576,253 +1566,13 @@ def make_loss_fns(args: "Args", actor: "Actor", critic: "Critic", action_size: i
         metrics_mean = jax.tree_util.tree_map(lambda x: x.mean(0), metrics)
         return train_state, metrics_mean
 
-    def run_epoch_separate(key, train_state, critic_batch, actor_batch):
-        """One epoch with separate critic (1+her_k)·S·E and actor S·E loops."""
-        mini_batch_size = (args.num_steps * args.num_envs) // args.num_mini_batches
-        critic_size = (1 + args.her_k) * args.num_steps * args.num_envs
-        actor_size = args.num_steps * args.num_envs
-        num_critic_minibatches = critic_size // mini_batch_size
-        num_actor_minibatches = actor_size // mini_batch_size
-
-        key, critic_shuffle_key = jax.random.split(key)
-        critic_indices = jax.random.permutation(critic_shuffle_key, critic_size)
-        critic_mb_idxs = critic_indices.reshape(
-            (num_critic_minibatches, mini_batch_size)
-        )
-        critic_minibatches = jax.tree_util.tree_map(
-            lambda x: jnp.take(x, critic_mb_idxs, axis=0), critic_batch
-        )
-
-        key, actor_shuffle_key, act_key, kl_key = jax.random.split(key, 4)
-        actor_indices = jax.random.permutation(actor_shuffle_key, actor_size)
-        actor_mb_idxs = actor_indices.reshape(
-            (num_actor_minibatches, mini_batch_size)
-        )
-        actor_minibatches = jax.tree_util.tree_map(
-            lambda x: jnp.take(x, actor_mb_idxs, axis=0), actor_batch
-        )
-        actor_minibatches.extras["action_key"] = jax.random.split(
-            act_key, num_actor_minibatches
-        )
-        actor_minibatches.extras["kl_key"] = jax.random.split(
-            kl_key, num_actor_minibatches
-        )
-
-        def update_both(train_state, minibatches):
-            critic_mb, actor_mb = minibatches
-            train_state, critic_metrics = update_critic(train_state, critic_mb)
-            train_state, actor_metrics = update_actor(train_state, actor_mb)
-            return train_state, {**critic_metrics, **actor_metrics}
-
-        paired_critic = jax.tree_util.tree_map(
-            lambda x: x[:num_actor_minibatches], critic_minibatches
-        )
-        remaining_critic = jax.tree_util.tree_map(
-            lambda x: x[num_actor_minibatches:], critic_minibatches
-        )
-
-        train_state, paired_metrics = jax.lax.scan(
-            update_both, train_state, (paired_critic, actor_minibatches)
-        )
-
-        train_state, remaining_critic_metrics = jax.lax.scan(
-            update_critic, train_state, remaining_critic
-        )
-
-        all_critic_metrics = jax.tree_util.tree_map(
-            lambda p, r: jnp.concatenate([p, r], axis=0).mean(0),
-            {k: v for k, v in paired_metrics.items() if k.startswith("critic")},
-            remaining_critic_metrics,
-        )
-        actor_metrics_mean = jax.tree_util.tree_map(
-            lambda x: x.mean(0),
-            {k: v for k, v in paired_metrics.items() if not k.startswith("critic")},
-        )
-
-        return train_state, {**all_critic_metrics, **actor_metrics_mean}
-
-    return (
-        critic_loss,
-        actor_loss,
-        compute_policy_kl,
-        update_critic,
-        update_actor,
-        run_epoch,
-        run_epoch_separate,
-    )
-
-
-# =============================================================================
-# Training state + checkpoint I/O
-# =============================================================================
-
-
-@flax.struct.dataclass
-class ReppoTrainingState:
-    """Training state: networks, optimizer state, RMS stats, and last env state."""
-    env_steps: jnp.ndarray
-    iteration: jnp.ndarray
-    actor_state: TrainState
-    critic_state: TrainState
-    actor_target_params: Any
-    normalization_state: NormalizationState
-    last_env_state: State
-
-
-def load_params(path: str):
-    with epath.Path(path).open("rb") as fin:
-        buf = fin.read()
-    return pickle.loads(buf)
-
-
-def save_params(path: str, params: Any):
-    """Save parameters in flax format (pickle)."""
-    with epath.Path(path).open("wb") as fout:
-        fout.write(pickle.dumps(params))
-
-
-# =============================================================================
-# Training driver
-#
-# train(args): end-to-end trainer. Builds env, networks, normalizer,
-# optimizers and helper closures, then runs an eval-interleaved outer loop:
-#
-#     for eval_epoch in range(num_evals):
-#         training_epoch       # jit-scanned train_step over eval_interval iters
-#         evaluator.run_evaluation
-#         log + checkpoint
-#
-# Each train_step = one rollout + one learner_fn call (N_epochs of SGD
-# over the collected batch).
-# =============================================================================
-
-
-def train(args: Args):
-    # --- Validation -------------------------------------------------------
-    if args.use_her_actor and not args.use_her_critic:
-        raise ValueError("use_her_actor=True requires use_her_critic=True")
-    if args.use_her_td_lambda and not args.use_her_critic:
-        raise ValueError("use_her_td_lambda=True requires use_her_critic=True")
-
-    assert (args.num_steps * args.num_envs) % args.num_mini_batches == 0, (
-        f"num_steps*num_envs ({args.num_steps * args.num_envs}) must be "
-        f"divisible by num_mini_batches ({args.num_mini_batches})"
-    )
-
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-
-    # --- Env + eval env ---------------------------------------------------
-    env_raw, obs_dim, goal_start_idx, goal_end_idx, success_thresh = make_env(args.env_id)
-    args.obs_dim = obs_dim
-    args.goal_start_idx = goal_start_idx
-    args.goal_end_idx = goal_end_idx
-    args.success_thresh = success_thresh
-    goal_dim = goal_end_idx - goal_start_idx
-    goal_indices = jnp.arange(goal_start_idx, goal_end_idx)
-    goal_reach_thresh = success_thresh
-
-    env = wrap_for_training(
-        env_raw,
-        episode_length=args.episode_length,
-        action_repeat=args.action_repeat,
-    )
-
-    eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
-    eval_env_raw, _, _, _, _ = make_env(eval_env_id)
-    eval_env = envs.training.wrap(eval_env_raw, episode_length=args.episode_length)
-
-    obs_size = env.observation_size
-    action_size = env.action_size
-    print(f"obs_size: {obs_size}, action_size: {action_size}", flush=True)
-    print(
-        f"obs_dim: {args.obs_dim}, "
-        f"goal_start_idx: {args.goal_start_idx}, goal_end_idx: {args.goal_end_idx}, "
-        f"success_thresh: {args.success_thresh}",
-        flush=True,
-    )
-
-    # --- Networks + normalizer -------------------------------------------
-    normalizer = Normalizer()
-    actor = Actor(
-        action_size=action_size,
-        network_width=args.actor_network_width,
-        network_depth=args.actor_depth,
-        skip_connections=args.actor_skip_connections,
-        use_relu=args.use_relu,
-        kl_start=args.kl_start,
-        ent_start=args.ent_start,
-    )
-    critic = Critic(
-        action_size=action_size,
-        network_width=args.critic_network_width,
-        network_depth=args.critic_depth,
-        skip_connections=args.critic_skip_connections,
-        use_relu=args.use_relu,
-        num_bins=args.num_bins,
-        vmin=args.vmin,
-        vmax=args.vmax,
-    )
-
-    # --- Optimizers -------------------------------------------------------
-    if args.anneal_lr:
-        actor_lr = optax.linear_schedule(
-            init_value=args.actor_lr,
-            end_value=0.0,
-            transition_steps=args.total_time_steps,
-        )
-        critic_lr = optax.linear_schedule(
-            init_value=args.critic_lr,
-            end_value=0.0,
-            transition_steps=args.total_time_steps,
-        )
-    else:
-        actor_lr = args.actor_lr
-        critic_lr = args.critic_lr
-    actor_opt = optax.chain(
-        optax.clip_by_global_norm(args.max_grad_norm), optax.adam(actor_lr)
-    )
-    critic_opt = optax.chain(
-        optax.clip_by_global_norm(args.max_grad_norm), optax.adam(critic_lr)
-    )
-
-    # --- Helper factories -------------------------------------------------
-    (
-        replace_goal_in_obs,
-        compute_goal_reward,
-        her_augment,
-        td0_targets,
-    ) = make_her_helpers(args, goal_indices, goal_dim, goal_reach_thresh)
-    (
-        nstep_lambda,
-        compute_extras,
-        compute_extras_alt,
-        compute_alt_td_lambda_targets_k,
-    ) = make_td_lambda_helpers(
-        args,
-        actor,
-        critic,
-        normalizer,
-        goal_indices,
-        goal_reach_thresh,
-        replace_goal_in_obs,
-        fusion_dim=args.critic_network_width,
-    )
+    # === Stagger helpers (factory stays — orthogonal to algorithm) ===
     (
         select_active_envs,
         stagger_env_state,
         compute_stagger_debug_metrics,
         maybe_print_stagger_debug_summary,
     ) = make_stagger_helpers(args, env)
-    (
-        critic_loss,
-        actor_loss,
-        compute_policy_kl,
-        update_critic,
-        update_actor,
-        run_epoch,
-        run_epoch_separate,
-    ) = make_loss_fns(args, actor, critic, action_size)
 
     # --- init_train_state -------------------------------------------------
     def init_train_state(key: jax.random.PRNGKey) -> ReppoTrainingState:
@@ -1925,195 +1675,160 @@ def train(args: Args):
 
     # --- Learner ----------------------------------------------------------
     def learner_fn(key, train_state: ReppoTrainingState, batch: RolloutTransition):
-        """Process one rollout batch: build targets, then run N_epochs of SGD."""
+        """One iteration of v6: HER augment, build TD-lambda targets for the
+        original and each hindsight goal, then run N_epochs of joint
+        critic+actor SGD on the unified dataset.
+        """
         S, E = args.num_steps, args.num_envs
         N = S * E
         k = args.her_k
 
-        # --- 1. HER augmentation: sample k hindsight goals per step ---
-        if args.use_her_critic:
-            key, her_key = jax.random.split(key)
-            (
-                obs_alt_raw,
-                next_obs_alt_raw,
-                reward_alt,
-                done_alt,
-                truncated_alt,
-                valid_mask_alt,
-                g_alt,
-                end_idx,
-            ) = her_augment(her_key, batch)
+        # Step 2 (v6): HER 'future' augmentation. For each step t in each
+        # env, sample k hindsight goals from the remainder of the same
+        # episode segment [t, e(t)]. Slots with fewer than k future steps
+        # are flagged via valid_mask_alt.
+        key, her_key = jax.random.split(key)
+        (
+            obs_alt_raw,
+            next_obs_alt_raw,
+            reward_alt,
+            done_alt,
+            truncated_alt,
+            valid_mask_alt,
+            g_alt,
+            end_idx,
+        ) = her_augment(her_key, batch)
 
-        # Save the raw (un-normalized) batch; compute_alt_td_lambda_targets_k
-        # needs it because it normalizes obs internally with different goals.
-        if args.use_her_td_lambda:
-            batch_raw = batch
+        # Capture raw rollout fields BEFORE normalization so the hindsight
+        # target can re-normalize obs after splicing in the alt goal.
+        raw_obs = batch.obs
+        raw_action = batch.action
+        raw_next_obs = batch.next_obs
+        raw_done = batch.done
+        raw_truncated = batch.truncated
 
-        # --- 2. Update running observation normalizer (mask-aware) ---
-        # The update uses the fresh batch; the batch itself is normalized
-        # below with the *pre-update* stats so targets and losses are
-        # consistent with the stats the networks were trained on.
+        # Update running normalizer with the fresh batch, but normalize the
+        # batch itself with PRE-update stats so targets and losses match
+        # the stats the networks were trained on this iteration.
         new_norm_state = normalizer.update(
             train_state.normalization_state, batch.obs
         )
         norm_state = train_state.normalization_state
 
-        # --- 3. Normalize observations for the networks ---
-        if args.use_her_critic:
-            obs_alt = normalizer.normalize(norm_state, obs_alt_raw)
-            next_obs_alt = normalizer.normalize(norm_state, next_obs_alt_raw)
+        obs_alt = normalizer.normalize(norm_state, obs_alt_raw)
+        next_obs_alt = normalizer.normalize(norm_state, next_obs_alt_raw)
         batch = batch.replace(
             obs=normalizer.normalize(norm_state, batch.obs),
             next_obs=normalizer.normalize(norm_state, batch.next_obs),
         )
         train_state = train_state.replace(normalization_state=new_norm_state)
 
-        # --- 4. Original trajectory: soft rewards, V(next), and TD-lambda targets ---
+        # Step 3 (v6, original trajectory): soft reward, V(next), and the
+        # standard TD-lambda return G_t^{(orig)}.
         key, orig_key = jax.random.split(key)
-        extras_orig = compute_extras(key=orig_key, train_state=train_state, batch=batch)
+        extras_orig = compute_extras(
+            key=orig_key, train_state=train_state, batch=batch
+        )
         batch.extras.update(extras_orig)
-        batch.extras["target_values"] = jax.lax.stop_gradient(nstep_lambda(batch=batch))
+        batch.extras["target_values"] = jax.lax.stop_gradient(
+            nstep_lambda(batch=batch)
+        )
 
-        # --- 5. Freeze the target policy used by the actor's KL branch ---
+        # Behavior policy freeze: theta' <- theta. Used by the actor's KL
+        # branch as the trust-region anchor for this iteration.
         train_state = train_state.replace(
             actor_target_params=train_state.actor_state.params
         )
 
-        is_ratio_mean = None
-        # --- 6. Hindsight targets: IS-corrected TD-lambda or plain TD(0) ---
-        if args.use_her_critic:
-            key, alt_key = jax.random.split(key)
+        # Step 3 (v6, hindsight): IS-corrected TD-lambda return G_t^{(alt,j)}
+        # for each hindsight slot j, computed by scanning compute_alt_target
+        # over the k axis of g_alt.
+        key, alt_key = jax.random.split(key)
 
-            if args.use_her_td_lambda:
-                # Full TD-lambda target over the remaining segment with
-                # per-decision IS ratio. One scan step per hindsight slot.
-                def _compute_alt_targets_lambda(rng, g_alt_single_k):
-                    rng, k_key = jax.random.split(rng)
-                    tv_k, mean_rho_k, next_emb_k = compute_alt_td_lambda_targets_k(
-                        key=k_key,
-                        train_state=train_state,
-                        batch_raw=batch_raw,
-                        norm_state=norm_state,
-                        g_alt_k=g_alt_single_k,
-                        end_idx=end_idx,
-                    )
-                    return rng, (tv_k, mean_rho_k, next_emb_k)
-
-                _, (target_values_alt_k, mean_rho_per_k, next_emb_alt_k) = jax.lax.scan(
-                    _compute_alt_targets_lambda,
-                    alt_key,
-                    jnp.moveaxis(g_alt, 2, 0),
-                )
-                is_ratio_mean = jnp.mean(mean_rho_per_k)
-                target_values_alt = jnp.moveaxis(target_values_alt_k, 0, 2)
-                next_emb_alt = jnp.moveaxis(next_emb_alt_k, 0, 2)
-            else:
-                # Simpler one-step TD(0) target using a fresh action under g_alt.
-                def _compute_alt_targets(rng, inputs):
-                    obs_k, next_obs_k, reward_k, done_k = inputs
-                    rng, k_key = jax.random.split(rng)
-                    extras_k = compute_extras_alt(
-                        key=k_key,
-                        train_state=train_state,
-                        obs_alt=obs_k,
-                        next_obs_alt=next_obs_k,
-                        reward_alt=reward_k,
-                        done_alt=done_k,
-                    )
-                    tv_k = td0_targets(
-                        extras_k["soft_reward"], extras_k["next_value"], done_k
-                    )
-                    return rng, (tv_k, extras_k["next_emb"])
-
-                _, (target_values_alt_k, next_emb_alt_k) = jax.lax.scan(
-                    _compute_alt_targets,
-                    alt_key,
-                    (
-                        jnp.moveaxis(obs_alt, 2, 0),
-                        jnp.moveaxis(next_obs_alt, 2, 0),
-                        jnp.moveaxis(reward_alt, 2, 0),
-                        jnp.moveaxis(done_alt, 2, 0),
-                    ),
-                )
-                target_values_alt = jnp.moveaxis(target_values_alt_k, 0, 2)
-                next_emb_alt = jnp.moveaxis(next_emb_alt_k, 0, 2)
-
-            # --- 7. Build the combined batch: original (S*E rows, valid_mask=1)
-            #        plus hindsight (k*S*E rows, valid_mask = 1 for valid slots,
-            #        0 otherwise) flattened over time/env ---
-            batch.extras["valid_mask"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
-            orig_flat = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
-
-            # The behavior action is the same for every hindsight slot at a
-            # given (t, e), so broadcast it across the k axis.
-            action_alt = jnp.broadcast_to(
-                batch.action[:, :, None, :], (S, E, k, batch.action.shape[-1])
+        def _alt_target_for_one_slot(rng, g_alt_one_slot):
+            rng, slot_key = jax.random.split(rng)
+            tv, mean_rho, next_emb = compute_alt_target(
+                key=slot_key,
+                train_state=train_state,
+                raw_obs=raw_obs,
+                raw_action=raw_action,
+                raw_next_obs=raw_next_obs,
+                raw_done=raw_done,
+                raw_truncated=raw_truncated,
+                norm_state=norm_state,
+                g_alt=g_alt_one_slot,
+                end_idx=end_idx,
             )
-            alt_batch = RolloutTransition(
-                obs=obs_alt,
-                action=action_alt,
-                reward=reward_alt,
-                next_obs=next_obs_alt,
-                done=done_alt,
-                truncated=truncated_alt,
-                extras={
-                    "target_values": jax.lax.stop_gradient(target_values_alt),
-                    "valid_mask": valid_mask_alt,
-                    "next_emb": jax.lax.stop_gradient(next_emb_alt),
-                },
-            )
-            alt_flat = jax.tree_util.tree_map(
-                lambda x: x.reshape((k * N, *x.shape[3:])), alt_batch
-            )
+            return rng, (tv, mean_rho, next_emb)
 
-            orig_stripped = orig_flat.replace(
-                extras={
-                    "target_values": orig_flat.extras["target_values"],
-                    "valid_mask": jnp.ones(orig_flat.obs.shape[:-1], dtype=jnp.float32),
-                    "next_emb": orig_flat.extras["next_emb"],
-                }
+        _, (target_values_alt_per_slot, mean_rho_per_slot, next_emb_alt_per_slot) = (
+            jax.lax.scan(
+                _alt_target_for_one_slot,
+                alt_key,
+                jnp.moveaxis(g_alt, 2, 0),  # (S, E, k, ...) -> (k, S, E, ...)
             )
-            combined_batch = jax.tree_util.tree_map(
-                lambda o, a: jnp.concatenate([o, a], axis=0), orig_stripped, alt_flat
-            )
+        )
+        is_ratio_mean = jnp.mean(mean_rho_per_slot)
+        target_values_alt = jnp.moveaxis(target_values_alt_per_slot, 0, 2)
+        next_emb_alt = jnp.moveaxis(next_emb_alt_per_slot, 0, 2)
 
-            # --- 8. Run num_epochs of SGD on the combined batch ---
-            if args.use_her_actor:
-                # Actor sees hindsight samples too: both critic and actor use
-                # the full combined batch.
-                key, train_key = jax.random.split(key)
-                train_state, update_metrics = jax.lax.scan(
-                    f=lambda ts, k_: run_epoch(k_, ts, combined_batch),
-                    init=train_state,
-                    xs=jax.random.split(train_key, args.num_epochs),
-                )
-            else:
-                # Actor sees only the original S*E samples; critic sees the
-                # combined (1 + k)*S*E batch.
-                key, train_key = jax.random.split(key)
-                train_state, update_metrics = jax.lax.scan(
-                    f=lambda ts, k_: run_epoch_separate(
-                        k_, ts, combined_batch, orig_flat
-                    ),
-                    init=train_state,
-                    xs=jax.random.split(train_key, args.num_epochs),
-                )
-        else:
-            # No HER: flatten the S x E batch and run num_epochs of joint
-            # critic + actor SGD on the original trajectory alone.
-            batch.extras["valid_mask"] = jnp.ones(batch.obs.shape[:-1], dtype=jnp.float32)
-            batch = jax.tree_util.tree_map(lambda x: x.reshape((N, *x.shape[2:])), batch)
+        # Step 4 (v6): Combine original and hindsight tuples into the
+        # unified dataset D. Each timestep t contributes 1 original tuple
+        # (valid_mask=1) and k hindsight tuples (valid_mask=1 for valid
+        # slots, 0 for slots that ran past the segment boundary).
+        batch.extras["valid_mask"] = jnp.ones(
+            batch.obs.shape[:-1], dtype=jnp.float32
+        )
+        orig_flat = jax.tree_util.tree_map(
+            lambda x: x.reshape((N, *x.shape[2:])), batch
+        )
 
-            key, train_key = jax.random.split(key)
-            train_state, update_metrics = jax.lax.scan(
-                f=lambda ts, k_: run_epoch(k_, ts, batch),
-                init=train_state,
-                xs=jax.random.split(train_key, args.num_epochs),
-            )
+        # The behavior action is shared across all k hindsight slots at a
+        # given (t, env), so broadcast it along the k axis.
+        action_alt = jnp.broadcast_to(
+            batch.action[:, :, None, :], (S, E, k, batch.action.shape[-1])
+        )
+        alt_batch = RolloutTransition(
+            obs=obs_alt,
+            action=action_alt,
+            reward=reward_alt,
+            next_obs=next_obs_alt,
+            done=done_alt,
+            truncated=truncated_alt,
+            extras={
+                "target_values": jax.lax.stop_gradient(target_values_alt),
+                "valid_mask": valid_mask_alt,
+                "next_emb": jax.lax.stop_gradient(next_emb_alt),
+            },
+        )
+        alt_flat = jax.tree_util.tree_map(
+            lambda x: x.reshape((k * N, *x.shape[3:])), alt_batch
+        )
+
+        # Trim orig_flat.extras down to the 3 keys alt_flat carries so the
+        # tree structures match for concatenation along axis 0.
+        orig_stripped = orig_flat.replace(
+            extras={
+                "target_values": orig_flat.extras["target_values"],
+                "valid_mask": orig_flat.extras["valid_mask"],
+                "next_emb": orig_flat.extras["next_emb"],
+            }
+        )
+        combined_batch = jax.tree_util.tree_map(
+            lambda o, a: jnp.concatenate([o, a], axis=0), orig_stripped, alt_flat
+        )
+
+        # Step 5 (v6): N_epochs of joint critic + actor SGD over D.
+        # Targets are fixed for the iteration; each epoch reshuffles.
+        key, train_key = jax.random.split(key)
+        train_state, update_metrics = jax.lax.scan(
+            f=lambda ts, ek: run_epoch(ek, ts, combined_batch),
+            init=train_state,
+            xs=jax.random.split(train_key, args.num_epochs),
+        )
 
         update_metrics = jax.tree_util.tree_map(lambda x: x[-1], update_metrics)
-        if args.use_her_td_lambda and is_ratio_mean is not None:
-            update_metrics["critic/is_ratio_mean"] = is_ratio_mean
+        update_metrics["critic/is_ratio_mean"] = is_ratio_mean
         return train_state, update_metrics
 
     # --- train_step + training_epoch -------------------------------------
@@ -2307,19 +2022,11 @@ def train(args: Args):
 def main():
     args = tyro.cli(Args)
 
-    # Build a compact run_name that summarizes the HER flags, target type,
-    # k (number of hindsight goals per step), and actor depth.
-    name_parts = []
-    if args.use_her_critic:
-        name_parts.append("c")
-    if args.use_her_actor:
-        name_parts.append("a")
-    name_parts.append("tdL" if args.use_her_td_lambda else "td0")
-    name_parts.append(f"k{args.her_k}")
-    name_parts.append(f"d{args.actor_depth}")
-    run_name = "_".join(name_parts)
+    # Run name summarizes the variation axes (HER ratio k and actor depth);
+    # group string mirrors that plus an optional stagger tag and a timestamp.
+    run_name = f"k{args.her_k}_d{args.actor_depth}"
 
-    group_parts = list(name_parts)
+    group_parts = [f"k{args.her_k}", f"d{args.actor_depth}"]
     if args.stagger_envs:
         group_parts.append("stag")
     group_parts.append(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
