@@ -30,6 +30,7 @@ import optax
 import tyro
 import wandb
 import wandb_osh
+import yaml
 from brax import envs
 from brax.envs.base import PipelineEnv, State, Wrapper
 from brax.envs.wrappers.training import EpisodeWrapper, VmapWrapper
@@ -68,11 +69,11 @@ class Args:
     eval_env_id: str = ""              # empty => falls back to env_id
     episode_length: int = 1000
     action_repeat: int = 1
-    goal_reach_thresh: float = 0.5
     # filled at runtime by make_env:
     obs_dim: int = 0
     goal_start_idx: int = 0
     goal_end_idx: int = 0
+    success_thresh: float = 0.0
 
     # --- REPPO training sizes ---
     num_envs: int = 128
@@ -523,9 +524,42 @@ def action_dist(mean: jax.Array, log_std: jax.Array) -> distrax.Distribution:
 # Env registry (copied verbatim from scaling-crl for fair comparison)
 #
 # Each branch constructs a goal-conditioned Brax env and returns the
-# (obs_dim, goal_start_idx, goal_end_idx) slicing triple so downstream code
-# knows where the goal lives inside the concatenated observation.
+# (obs_dim, goal_start_idx, goal_end_idx, success_thresh) tuple so downstream
+# code knows where the goal lives inside the concatenated observation and
+# what threshold the env uses to declare a step "successful". The threshold
+# is loaded from envs/thresholds.yaml (keyed by env class name) and mirrors
+# the literal `dist < <threshold>` written inside each env's `step` method.
 # =============================================================================
+
+
+_ENV_THRESHOLDS_PATH = Path(__file__).parent / "envs" / "thresholds.yaml"
+_ENV_THRESHOLDS_CACHE: dict | None = None
+
+
+def _load_env_thresholds() -> dict:
+    global _ENV_THRESHOLDS_CACHE
+    if _ENV_THRESHOLDS_CACHE is None:
+        with open(_ENV_THRESHOLDS_PATH) as f:
+            loaded = yaml.safe_load(f)
+        if not isinstance(loaded, dict):
+            raise ValueError(
+                f"Expected {_ENV_THRESHOLDS_PATH} to be a yaml mapping, "
+                f"got {type(loaded).__name__}"
+            )
+        _ENV_THRESHOLDS_CACHE = loaded
+    return _ENV_THRESHOLDS_CACHE
+
+
+def _lookup_success_thresh(env) -> float:
+    cls_name = type(env).__name__
+    thresholds = _load_env_thresholds()
+    if cls_name not in thresholds:
+        raise KeyError(
+            f"No success threshold for env class {cls_name!r}. "
+            f"Add `{cls_name}: <value>` to {_ENV_THRESHOLDS_PATH}, "
+            f"matching the literal in the env's `step` method."
+        )
+    return float(thresholds[cls_name])
 
 
 def make_env(env_id: str):
@@ -630,7 +664,8 @@ def make_env(env_id: str):
     else:
         raise NotImplementedError(f"Unknown env_id: {env_id}")
 
-    return env, obs_dim, goal_start_idx, goal_end_idx
+    success_thresh = _lookup_success_thresh(env)
+    return env, obs_dim, goal_start_idx, goal_end_idx, success_thresh
 
 
 # =============================================================================
@@ -1678,13 +1713,14 @@ def train(args: Args):
     np.random.seed(args.seed)
 
     # --- Env + eval env ---------------------------------------------------
-    env_raw, obs_dim, goal_start_idx, goal_end_idx = make_env(args.env_id)
+    env_raw, obs_dim, goal_start_idx, goal_end_idx, success_thresh = make_env(args.env_id)
     args.obs_dim = obs_dim
     args.goal_start_idx = goal_start_idx
     args.goal_end_idx = goal_end_idx
+    args.success_thresh = success_thresh
     goal_dim = goal_end_idx - goal_start_idx
     goal_indices = jnp.arange(goal_start_idx, goal_end_idx)
-    goal_reach_thresh = args.goal_reach_thresh
+    goal_reach_thresh = success_thresh
 
     env = wrap_for_training(
         env_raw,
@@ -1693,7 +1729,7 @@ def train(args: Args):
     )
 
     eval_env_id = args.eval_env_id if args.eval_env_id else args.env_id
-    eval_env_raw, _, _, _ = make_env(eval_env_id)
+    eval_env_raw, _, _, _, _ = make_env(eval_env_id)
     eval_env = envs.training.wrap(eval_env_raw, episode_length=args.episode_length)
 
     obs_size = env.observation_size
@@ -1701,7 +1737,8 @@ def train(args: Args):
     print(f"obs_size: {obs_size}, action_size: {action_size}", flush=True)
     print(
         f"obs_dim: {args.obs_dim}, "
-        f"goal_start_idx: {args.goal_start_idx}, goal_end_idx: {args.goal_end_idx}",
+        f"goal_start_idx: {args.goal_start_idx}, goal_end_idx: {args.goal_end_idx}, "
+        f"success_thresh: {args.success_thresh}",
         flush=True,
     )
 
@@ -1851,10 +1888,16 @@ def train(args: Args):
             # Clip strictly inside the tanh range for a finite log-prob.
             action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_env_state = env.step(env_state, action)
+            # GCRL sparse reward: the env's `metrics["success"]` is computed
+            # inside its own `step` method using its own threshold and
+            # distance formula (e.g. ant_maze.py:450 uses dist<0.5;
+            # arm_push_easy.py:60 uses dist<0.1). Reading it verbatim means
+            # no threshold or distance computation lives on the algorithm side.
+            sparse_reward = next_env_state.metrics["success"]
             transition = RolloutTransition(
                 obs=env_state.obs,
                 action=action,
-                reward=next_env_state.reward,
+                reward=sparse_reward,
                 next_obs=next_env_state.info["raw_obs"],
                 done=next_env_state.done,
                 truncated=next_env_state.info["truncation"],
@@ -1862,6 +1905,7 @@ def train(args: Args):
                     **next_env_state.info,
                     "train_metrics": next_env_state.metrics,
                     "train_done_mask": next_env_state.done.astype(jnp.bool_),
+                    "env_reward": next_env_state.reward,
                 },
             )
             return (key, next_env_state), transition
