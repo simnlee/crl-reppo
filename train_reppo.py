@@ -108,7 +108,6 @@ class Args:
     use_her_td_lambda: bool = False
     her_k: int = 4
     her_goal_sampling: str = "uniform"   # 'uniform'|'geometric'
-    sample_new_action_for_tdL: bool = False
     her_per_epoch: bool = False          # v7b: resample HER + recompute hindsight TD-lambda every inner epoch
 
     # --- Stagger ---
@@ -1067,17 +1066,11 @@ def make_td_lambda_helpers(
             trunc_u = batch_raw.truncated[u]
             term_mask = 1.0 - term_u[None, :] * (1.0 - trunc_u[None, :])
 
-            if args.sample_new_action_for_tdL:
-                # Use the fresh-action log-prob for both boundary and interior.
-                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
-                soft_r_int = soft_r_bnd
-            else:
-                # Boundary: fresh-action log-prob. Interior: per-decision IS
-                # estimator of -H[pi_{theta'}(.|x_{u+1}, g_alt)] applied to
-                # Lemma 1 with f(a) = log pi_{theta'}(a | x_{u+1}, g_alt), i.e.
-                # rho * log pi_{theta'}(a_obs | x_{u+1}, g_alt) = rho * is_num_log.
-                soft_r_bnd = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
-                soft_r_int = reward_u - args.gamma * alpha * term_mask * rho * is_num_log
+            # Max-entropy correction at every step uses a fresh action sampled
+            # under g_alt:
+            #   r_tilde_u = r_u - gamma * (1 - term_u*(1-trunc_u)) * e^alpha
+            #                         * log pi(a'_{u+1} | x_{u+1}, g_alt).
+            soft_r = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
 
             # For each t, u is the segment boundary if u == end_idx[t, e],
             # and is an interior step if t <= u < end_idx[t, e].
@@ -1090,12 +1083,12 @@ def make_td_lambda_helpers(
             rho_count = rho_count + jnp.sum(is_interior.astype(rho.dtype))
 
             # Boundary target: r_tilde + gamma * (trunc ? V : (1 - term) * V).
-            G_bnd = soft_r_bnd + args.gamma * jnp.where(
+            G_bnd = soft_r + args.gamma * jnp.where(
                 trunc_u[None, :], V_u, (1.0 - term_u[None, :]) * V_u
             )
             # Interior target: r_tilde + gamma * (1 - term)
             #                           * ((1 - lambda*rho)*V + lambda*rho*G).
-            G_int = soft_r_int + args.gamma * jnp.where(
+            G_int = soft_r + args.gamma * jnp.where(
                 trunc_u[None, :],
                 V_u,
                 (1.0 - term_u[None, :])
@@ -2483,8 +2476,6 @@ def main():
     group_parts = list(name_parts)
     if args.stagger_envs:
         group_parts.append("stag")
-    if args.sample_new_action_for_tdL:
-        group_parts.append("sample-new-action")
     group_parts.append(datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
     auto_group = "_".join(group_parts)
 
