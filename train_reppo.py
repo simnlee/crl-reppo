@@ -91,13 +91,13 @@ class Args:
     success_thresh: float = 0.0
 
     # --- REPPO training sizes ---
-    num_envs: int = 128
+    num_envs: int = 1024
     num_eval_envs: int = 256
-    num_steps: int = 1000
+    num_steps: int = 128 # rollout length
     num_mini_batches: int = 64 # minibatch size = num_steps*num_envs / num_mini_batches
     num_epochs: int = 8
     num_eval: int = 200
-    total_time_steps: int = 50_000_000
+    total_time_steps: int = 100_000_000
 
     # --- REPPO LR + schedule ---
     actor_lr: float = 6e-4
@@ -1410,6 +1410,12 @@ def train(args: Args):
             * (1.0 - minibatch.truncated)
             * (critic_update_loss + args.aux_loss_coeff * aux_loss)
         ) / jnp.maximum((mask * (1.0 - minibatch.truncated)).sum(), 1.0)
+        mask_bool = mask > 0
+        reward_is_binary = jnp.where(
+            mask_bool,
+            (minibatch.reward == 0.0) | (minibatch.reward == 1.0),
+            True,
+        ).all().astype(jnp.float32)
         return loss, dict(
             value_mse=critic_mse,
             cross_entropy_loss=critic_update_loss.mean(),
@@ -1419,6 +1425,9 @@ def train(args: Args):
             q=value.mean(),
             abs_batch_action=jnp.abs(minibatch.action).mean(),
             reward_mean=minibatch.reward.mean(),
+            reward_min=jnp.where(mask_bool, minibatch.reward, jnp.inf).min(),
+            reward_max=jnp.where(mask_bool, minibatch.reward, -jnp.inf).max(),
+            reward_is_binary=reward_is_binary,
             target_values=target_values.mean(),
         )
 
@@ -1499,6 +1508,12 @@ def train(args: Args):
 
         loss += jnp.sum(mask * target_entropy_loss) / n_valid
         loss += jnp.sum(mask * lagrangian_loss) / n_valid
+        mask_bool = mask > 0
+        reward_is_binary = jnp.where(
+            mask_bool,
+            (minibatch.reward == 0.0) | (minibatch.reward == 1.0),
+            True,
+        ).all().astype(jnp.float32)
         return loss, dict(
             actor_loss=per_actor_loss.mean(),
             loss=loss.mean(),
@@ -1506,6 +1521,9 @@ def train(args: Args):
             abs_batch_action=jnp.abs(minibatch.action).mean(),
             abs_pred_action=jnp.abs(pred_action).mean(),
             reward_mean=minibatch.reward.mean(),
+            reward_min=jnp.where(mask_bool, minibatch.reward, jnp.inf).min(),
+            reward_max=jnp.where(mask_bool, minibatch.reward, -jnp.inf).max(),
+            reward_is_binary=reward_is_binary,
             kl=kl.mean(),
             lagrangian=lagrangian,
             lagrangian_loss=lagrangian_loss.mean(),
@@ -1829,6 +1847,23 @@ def train(args: Args):
 
         update_metrics = jax.tree_util.tree_map(lambda x: x[-1], update_metrics)
         update_metrics["critic/is_ratio_mean"] = is_ratio_mean
+        her_mask_bool = valid_mask_alt > 0
+        her_n_valid = jnp.maximum(her_mask_bool.sum(), 1.0)
+        her_reward_is_binary = jnp.where(
+            her_mask_bool,
+            (reward_alt == 0.0) | (reward_alt == 1.0),
+            True,
+        ).all().astype(jnp.float32)
+        update_metrics["her/reward_min"] = jnp.where(
+            her_mask_bool, reward_alt, jnp.inf
+        ).min()
+        update_metrics["her/reward_max"] = jnp.where(
+            her_mask_bool, reward_alt, -jnp.inf
+        ).max()
+        update_metrics["her/reward_mean"] = (
+            jnp.sum(her_mask_bool * reward_alt) / her_n_valid
+        )
+        update_metrics["her/reward_is_binary"] = her_reward_is_binary
         return train_state, update_metrics
 
     # --- train_step + training_epoch -------------------------------------
@@ -1846,12 +1881,20 @@ def train(args: Args):
         state, update_metrics = learner_fn(
             key=learn_key, train_state=state, batch=transitions
         )
+        rollout_reward = transitions.reward
+        rollout_reward_is_binary = (
+            (rollout_reward == 0.0) | (rollout_reward == 1.0)
+        ).all().astype(jnp.float32)
         metrics = {
             **update_metrics,
             **compute_stagger_debug_metrics(transitions),
             **prefix_dict("episode", train_episode_metrics),
             "rollout/done_frac": jnp.mean(transitions.done.astype(jnp.float32)),
             "rollout/trunc_frac": jnp.mean(transitions.truncated.astype(jnp.float32)),
+            "rollout/reward_min": jnp.min(rollout_reward),
+            "rollout/reward_max": jnp.max(rollout_reward),
+            "rollout/reward_mean": jnp.mean(rollout_reward),
+            "rollout/reward_is_binary": rollout_reward_is_binary,
         }
         state = state.replace(iteration=state.iteration + 1)
         return state, metrics
