@@ -48,7 +48,7 @@ class Args:
     exp_name: str = "reppo"
     seed: int = 42
     track: bool = True
-    wandb_project_name: str = "reppo-crl-depth"
+    wandb_project_name: str = ""
     wandb_entity: str = "simlee-upenn"
     wandb_mode: str = "offline"        # 'offline'|'online'|'disabled'
     wandb_dir: str = "."
