@@ -44,7 +44,7 @@ from train import (
 
 @dataclass
 class Args:
-    # --- Run / logging ergonomics ---
+    # --- Run / logging ---
     exp_name: str = "reppo"
     seed: int = 42
     track: bool = True
@@ -58,7 +58,7 @@ class Args:
     vis_length: int = 1000
     num_render: int = 10
 
-    # --- env ---
+    # --- Environment ---
     env_id: str = "ant"
     eval_env_id: str = "" # empty => falls back to env_id
     episode_length: int = 1000
@@ -69,7 +69,7 @@ class Args:
     goal_end_idx: int = 0
     success_thresh: float = 0.0 # env-specific distance threshold for success, loaded from envs/thresholds.yaml
 
-    # --- REPPO training sizes ---
+    # --- Training parameters ---
     num_envs: int = 1024
     num_eval_envs: int = 256
     num_steps: int = 128 # rollout length
@@ -78,42 +78,41 @@ class Args:
     num_eval: int = 200
     total_time_steps: int = 100_000_000
 
-    # --- REPPO LR + schedule ---
+    # --- REPPO hyperparameters ---
     actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     anneal_lr: bool = False
     max_grad_norm: float = 0.5
-
-    # --- REPPO algorithmic hparams ---
     gamma: float = 0.99
     lmbda: float = 0.95
     kl_start: float = 0.01
     kl_bound: float = 0.1
     ent_start: float = 0.01
-    ent_target_mult: float = 0.5
+    ent_target_mult: float = 0.5 # target entropy = ent_target_mult * |A|
     num_bins: int = 151
-    vmin: float = 0.0
-    vmax: float = 150.0
-    num_action_samples: int = 16
+    vmin: float = 0.0 # center of first bin
+    vmax: float = 150.0 # center of last bin
+    num_action_samples: int = 16 # number of action samples for the actor loss's KL and entropy estimates
     aux_loss_coeff: float = 0.0
 
     # --- HER ---
-    her_k: int = 1
+    her_k: int = 1 # number of HER goals per original transition
 
     # --- Stagger ---
     stagger_envs: bool = True
     stagger_debug: bool = True
 
-    # --- Networks (depth-scaling axis follows scaling-crl) ---
+    # --- Networks ---
+    # these are copied from the scaling-crl repo
     actor_network_width: int = 256
     actor_depth: int = 4
     critic_network_width: int = 256
     critic_depth: int = 4
-    actor_skip_connections: int = 0 # unused, copied from CRL repo for future exploration of skip connections in the actor
-    critic_skip_connections: int = 0 # reserved, copied from CRL repo for future exploration of skip connections in the critic
+    actor_skip_connections: int = 0 # unused
+    critic_skip_connections: int = 0 # unused
     use_relu: int = 0 # 0 => swish, 1 => relu (from CRL repo)
 
-    # --- env-0 transition logging (goal-buffer comparison study) ---
+    # --- env-0 transition logging ---
     log_env0_transitions: bool = False
 
 
@@ -121,11 +120,10 @@ class Args:
 # Normalizer
 # =============================================================================
 
-
 class NormalizationState(struct.PyTreeNode):
-    mean: struct.PyTreeNode
-    var: struct.PyTreeNode
-    count: int
+    mean: struct.PyTreeNode # shape=(obs_dim,) per observation feature
+    var: struct.PyTreeNode # shape=(obs_dim,) per observation feature
+    count: int # number of samples folded into the running mean/var
 
 
 class Normalizer:
@@ -138,8 +136,8 @@ class Normalizer:
     @functools.partial(jax.jit, static_argnums=0)
     def init(self, tree: struct.PyTreeNode) -> NormalizationState:
         return NormalizationState(
-            mean=jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), tree),
-            var=jax.tree_util.tree_map(lambda x: jnp.ones_like(x), tree),
+            mean=jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), tree), # init mean=0
+            var=jax.tree_util.tree_map(lambda x: jnp.ones_like(x), tree), # init var=1 
             count=jax.tree_util.tree_map(lambda x: jnp.array(0, dtype=jnp.int32), tree),
         )
 
@@ -181,6 +179,10 @@ class Normalizer:
 # =============================================================================
 
 
+# Custom auto-reset that also preserves the pre-reset terminal obs in
+# info['raw_obs']. Brax's stock AutoResetWrapper overwrites state.obs with
+# the post-reset start state on done ticks, destroying the true terminal
+# observation that HER needs to relabel achieved goals.
 class AutoResetWrapper(Wrapper):
     """Auto-resets env on done, storing pre-reset obs in info['raw_obs']."""
 
@@ -221,14 +223,14 @@ def wrap_for_training(
     action_repeat: int = 1,
 ):
     """VmapWrapper -> EpisodeWrapper -> AutoResetWrapper with raw_obs."""
-    env = VmapWrapper(env)
-    env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=action_repeat)
-    env = AutoResetWrapper(env)
+    env = VmapWrapper(env) # parallelize environments
+    env = EpisodeWrapper(env, episode_length=episode_length, action_repeat=action_repeat) # add time limit handling and episode-level info aggregation
+    env = AutoResetWrapper(env) # auto-reset on done and preserve pre-reset obs in info['raw_obs'] for HER relabeling
     return env
 
 
 # =============================================================================
-# hl_gauss
+# Categorical loss for CE loss
 # =============================================================================
 
 
@@ -308,25 +310,11 @@ def log_metrics(time_steps: int, eval_epoch: int, metrics: dict):
 # =============================================================================
 # Networks
 #
-# The residual-block stack (residual_block) and the Actor residual tower are
-# copied from scaling-crl so this experiment shares the same depth-scaling
-# axis as the CRL paper for a fair comparison. The Critic uses a single
-# residual trunk over concat(state, goal, action) and emits HL-Gauss
-# categorical return logits plus auxiliary next-embedding / next-reward
-# predictions.
+# The residual-block architecture(residual_block) and the Actor residual tower are
+# copied from scaling-crl for fair comparison.
 #
 #   residual_block : Dense -> Norm -> Act, four times, with an identity
 #                    shortcut added at the end.
-#   Critic         : single residual trunk on concat(obs, action); a
-#                    Dense+Norm+Act projection feeds HL-Gauss categorical
-#                    logits over return bins, plus auxiliary predictions of
-#                    the next embedding and the next reward.
-#   Actor          : Dense stem + residual blocks, two Dense heads for the
-#                    mean and log_std of a tanh-squashed diagonal Gaussian.
-#                    Also carries two scalar log-parameters:
-#                      * log_lagrangian  = log(beta), the KL multiplier
-#                      * log_temperature = log(alpha), the entropy coef
-#   action_dist    : distrax tanh-Normal used for sampling and log-probs.
 # =============================================================================
 
 
@@ -334,6 +322,15 @@ class Actor(nn.Module):
     """
     Returns `(mean, log_std)` by default. With `deterministic=True`, returns
     `jnp.tanh(mean)`. `log_std` is unclamped.
+
+    Differences from Actor in scaling-crl:
+      - Holds two extra params: `log_lagrangian` (KL multiplier beta) and 
+      `log_temperature` (entropy coefficient alpha), updated by the actor's 
+      lagrangian_loss / target_entropy_loss.
+      - A `deterministic=True` path that returns `tanh(mean)` for evaluation.
+      - `log_std` is returned unclamped; CRL squashes it into [-5, 2] via tanh.
+      - Trunk (Dense -> Norm -> Act -> N residual blocks -> two heads) is
+        identical.
     """
 
     action_size: int
@@ -362,9 +359,11 @@ class Actor(nn.Module):
             (1,),
         )
 
+        # Layer normalization
         if self.norm_type == "layer_norm":
             normalize = lambda y: nn.LayerNorm()(y)
         else:
+            # if normalization is disabled, use the identity function
             normalize = lambda y: y
 
         if self.use_relu:
@@ -372,10 +371,11 @@ class Actor(nn.Module):
         else:
             activation = nn.swish
 
+        # Initial Dense -> Norm -> Act before the residual hidden blocks
         x = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         x = normalize(x)
         x = activation(x)
-        for i in range(self.network_depth // 4):
+        for i in range(self.network_depth // 4): # network depth must be divisible by 4
             x = residual_block(x, self.network_width, normalize, activation)
         # Two heads: mean and log_std of a diagonal Gaussian. Samples are
         # squashed through tanh by action_dist(mean, log_std).
@@ -383,26 +383,37 @@ class Actor(nn.Module):
         log_std = nn.Dense(self.action_size, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
 
         if deterministic:
-            # Evaluation path: pick the tanh-squashed mean as a point action.
+            # For evals, take the tanh-squashed mean
             return jnp.tanh(mean)
         return mean, log_std
 
 
 class Critic(nn.Module):
-    """Q(state, action, goal) with an HL-Gauss categorical return head.
-
-    Single residual trunk on concat(obs, action) = concat(state, goal, action).
-    The trunk output feeds a Dense+Norm+Act projection, which in turn feeds:
+    """
+    `Q(state, action, goal)` via a single residual trunk on
+    `concat(obs, action) = concat(state, goal, action)`. The trunk leads to a
+    categorical value head and a parallel auxiliary head. Returns a dict:
 
       value          : expected return under softmax(logits) over the
                        HL-Gauss bin support
-      logits         : raw categorical logits (num_bins)
+      logits         : raw categorical logits over HL-Gauss return bins
       probs          : softmax(logits)
-      embed          : trunk representation, also used as an auxiliary
-                       self-supervised target
-      pred_features  : auxiliary prediction of the next-step trunk embed
-                       (trained by MSE against a stop-grad target)
-      pred_rew       : auxiliary scalar reward prediction
+      embed          : embedding used for self-supervised target
+      pred_features  : prediction of the next-step embedding
+      pred_rew       : scalar next-step reward prediction
+
+    Differences from scaling-crl Critic:
+      - Single trunk on `concat(state, goal, action)` instead of separate SA/G 
+        towers for CRL
+      - Categorical HL-Gauss return head (`num_bins=151`, support `[0, 150]`)
+      - Learned `zero_dist` bias initialised so the untrained critic
+        predicts value ~ 0
+      - Auxiliary heads `pred_features` (next-step embed) and `pred_rew`
+        (next-step reward) for optional self-supervised losses.
+      - CRL ends each SA/G residual tower with a Dense(64). We remove this bottleneck
+        and feed the full embedding into the value and auxiliary heads. This is still
+        a fair comparison as we don't have separate full-width SA/G towers and we must
+        output to a categorical distribution over [vmin, vmax]
     """
 
     action_size: int
@@ -428,19 +439,16 @@ class Critic(nn.Module):
         x = activation(x)
         for _ in range(self.network_depth // 4):
             x = residual_block(x, self.network_width, normalize, activation)
-        fusion = x
-        fusion_dim = self.network_width
 
         # Projection head: Dense -> Norm -> Act -> Dense to num_bins logits.
-        q = nn.Dense(fusion_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(fusion)
+        q = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         q = normalize(q)
         q = activation(q)
         # Categorical logits over HL-Gauss return bins.
         logits = nn.Dense(self.num_bins, kernel_init=lecun_unfirom, bias_init=bias_init)(q)
 
-        # Learned bias of shape (num_bins,) initialized to HL-Gauss(0). Scaled
-        # by 40.0 so the untrained critic predicts value ~= 0 (the HL-Gauss
-        # bin concentrated at zero dominates the softmax at init).
+        # Learned bias of shape (num_bins,) initialized to hl_gauss(0). Scaled
+        # by 40.0 so the untrained critic predicts value ~= 0
         zero_dist = self.param(
             "zero_dist",
             lambda _rng, shape: hl_gauss(
@@ -456,29 +464,33 @@ class Critic(nn.Module):
         support = jnp.linspace(self.vmin, self.vmax, self.num_bins, endpoint=True)
         value = jnp.sum(probs * support, axis=-1)
 
-        # Auxiliary head off the same fused embedding. The final Dense emits
-        # (fusion_dim + 1) outputs: the first fusion_dim predict the next-step
-        # fused embedding, the last element predicts the next-step reward.
-        pred = nn.Dense(fusion_dim, kernel_init=lecun_unfirom, bias_init=bias_init)(fusion)
+        # Auxiliary head off the same residual trunk embedding. The final Dense emits
+        # (network_width + 1) outputs: the first network_width predicts the
+        # next-step embedding, the last element predicts the next-step reward.
+        pred = nn.Dense(self.network_width, kernel_init=lecun_unfirom, bias_init=bias_init)(x)
         pred = normalize(pred)
         pred = activation(pred)
         pred_raw = nn.Dense(
-            fusion_dim + 1, kernel_init=lecun_unfirom, bias_init=bias_init
+            self.network_width + 1, kernel_init=lecun_unfirom, bias_init=bias_init
         )(pred)
 
         return {
             "value": value,
             "logits": logits,
             "probs": probs,
-            "embed": fusion,
+            "embed": x,
             "pred_features": pred_raw[..., :-1],
             "pred_rew": pred_raw[..., -1:],
         }
 
 
 def action_dist(mean: jax.Array, log_std: jax.Array) -> distrax.Distribution:
-    """Tanh-squashed diagonal Gaussian action distribution."""
-    std = jnp.exp(log_std) + 1e-6
+    """Tanh-squashed diagonal Gaussian action distribution.
+
+    Actor returns raw `(mean, log_std)` tensors. Callers wrap them with this 
+    to get a distrax dist for `sample` / `log_prob`.
+    """
+    std = jnp.exp(log_std) + 1e-6 # add epsilon for numerical stability and ensure the distribution is well-defined even when log_std is very negative
     return distrax.Independent(
         distrax.Transformed(distrax.Normal(mean, std), distrax.Tanh()),
         reinterpreted_batch_ndims=1,
@@ -486,20 +498,18 @@ def action_dist(mean: jax.Array, log_std: jax.Array) -> distrax.Distribution:
 
 
 # =============================================================================
-# Env registry (copied verbatim from scaling-crl for fair comparison)
+# Env registry
 #
 # Each branch constructs a goal-conditioned Brax env and returns the
-# (obs_dim, goal_start_idx, goal_end_idx, success_thresh) tuple so downstream
-# code knows where the goal lives inside the concatenated observation and
-# what threshold the env uses to declare a step "successful". The threshold
-# is loaded from envs/thresholds.yaml (keyed by env class name) and mirrors
-# the literal `dist < <threshold>` written inside each env's `step` method.
+# (obs_dim, goal_start_idx, goal_end_idx, success_thresh) tuple. The goal-reaching
+# threshold is loaded from envs/thresholds.yaml (keyed by env class name) and mirrors
+# the threshold from the environment files in envs/*.py. This ensures that HER 
+# relabeling uses the same success criterion as the env's step function.
 # =============================================================================
 
 
 _ENV_THRESHOLDS_PATH = Path(__file__).parent / "envs" / "thresholds.yaml"
 _ENV_THRESHOLDS_CACHE: dict | None = None
-
 
 def _load_env_thresholds() -> dict:
     global _ENV_THRESHOLDS_CACHE
@@ -528,6 +538,10 @@ def _lookup_success_thresh(env) -> float:
 
 
 def make_env(env_id: str):
+    """
+    Copied from make_env in train.py, with only the addition of loading the env-specific 
+    success threshold from envs/thresholds.yaml for HER relabeling.
+    """
     print(f"making env with env_id: {env_id}", flush=True)
     if env_id == "reacher":
         from envs.reacher import Reacher
@@ -634,8 +648,10 @@ def make_env(env_id: str):
 
 
 # =============================================================================
-# RolloutTransition (Transition is imported from train.py for CRL parity)
-#
+# Transition struct is imported from train.py and used in CrlEvaluator
+# but we need a different RolloutTransition struct for the training loop to carry the
+# next_obs for HER relabeling, so we define that separately here.
+# 
 # RolloutTransition : rollout-time PyTree with an extra `next_obs` field
 #                     for HER goal relabeling.
 # =============================================================================
@@ -679,7 +695,7 @@ def compute_stagger_schedule(args: "Args"):
     Used by :func:`make_stagger_helpers` to partition envs into groups for
     the initial offset warmup.
     """
-    step_size = int(args.num_steps)
+    step_size = int(args.num_steps) # rollout length
     episode_length = int(args.episode_length)
     num_groups = max(-(-episode_length // step_size), 1)
     group_idx = jnp.arange(int(args.num_envs), dtype=jnp.int32) % num_groups
@@ -688,21 +704,37 @@ def compute_stagger_schedule(args: "Args"):
 
 def make_stagger_helpers(args: "Args", env):
     """Factory returning stagger helpers (select_active_envs, stagger_env_state,
-    compute_stagger_debug_metrics, maybe_print_stagger_debug_summary)."""
+    compute_stagger_debug_metrics, maybe_print_stagger_debug_summary).
+
+    Vectorized envs have no primitive for stepping a subset of envs, so we step all
+    envs and then use ``select_active_envs`` to pick the post-step state for each env
+    according to a per-env boolean mask. The mask is computed by ``stagger_env_state``,
+    which advances envs to staggered rollout offsets before training starts. We can do
+    this because Brax is purely functional and ``env.step`` returns a fresh ``next_state``
+    pytree without mutating the input. 
+    """
 
     def select_active_envs(mask, new_tree, old_tree):
-        """Select updated leaves for active envs; keep frozen envs unchanged."""
+        """
+        Per-env merge: keep ``new_tree`` for active envs, ``old_tree`` for frozen.
+        """
 
+        # if the leaf of the environment state PyTree doesn't have a leading env dimension
+        # matching the mask, just take the new leaf (e.g. scalar RNG key or global step)
         def select_leaf(new_leaf, old_leaf):
             if not hasattr(new_leaf, "shape"):
                 return new_leaf
             if new_leaf.shape and new_leaf.shape[0] == mask.shape[0]:
+                # reshape the mask to have same leading dimension as the leaf, and 
+                # broadcast across the rest of the dimensions
                 leaf_mask = jnp.reshape(
                     mask, (mask.shape[0],) + (1,) * (new_leaf.ndim - 1)
                 )
+                # where leaf_mask is True, take new_leaf; where False, take old_leaf
                 return jnp.where(leaf_mask, new_leaf, old_leaf)
             return new_leaf
 
+        # apply the select_leaf function to each leaf of the new_tree and old_tree pytrees
         return jax.tree_util.tree_map(select_leaf, new_tree, old_tree)
 
     def _stagger_step_size() -> int:
@@ -831,9 +863,12 @@ def make_stagger_helpers(args: "Args", env):
             active = step_idx < offset_steps
             done_mask = jnp.asarray(next_state.done > 0, dtype=jnp.bool_)
             done_counts = done_counts + (active & done_mask).astype(jnp.int32)
+            # Frozen envs keep ``state``: env.step is purely functional, so discarding their
+            # next_state and keeping the old state is a valid no-op that doesn't mutate the env
             state = select_active_envs(active, next_state, state)
             return (rng, state, done_counts), None
 
+        # warmup_done_counts tracks how many times each env hit done during the stagger warmup
         (_, env_state, warmup_done_counts), _ = jax.lax.scan(
             warmup_step,
             init=(key, env_state, jnp.zeros(args.num_envs, dtype=jnp.int32)),
@@ -975,8 +1010,7 @@ def train(args: Args):
 
     # === HER helpers ===
     # Achieved goals are read from `obs[..., goal_indices]` (a contiguous range
-    # set per-env by make_env). All three closures capture `args`, `goal_indices`,
-    # `goal_dim`, `goal_reach_thresh` from the surrounding `train` scope.
+    # set per-env by make_env).
 
     def replace_goal_in_obs(obs, new_goal):
         """Replace last goal_dim dims of obs with new_goal."""
@@ -1009,61 +1043,62 @@ def train(args: Args):
         boundaries = jnp.maximum(batch.done, batch.truncated)
         step_idx = jnp.broadcast_to(jnp.arange(S)[:, None], (S, E))
 
-        # Reverse scan: end_idx[t, e] = smallest t' >= t with boundaries=1
-        # (or S-1 if no boundary before the rollout ends).
-        def scan_end(carry, x):
-            t, b = x
-            end = jnp.where(b, t, carry)
-            return end, end
+        # Reverse scan: for each step t, propagate the nearest episode boundary
+        # at or after t backward through the rollout to get end_idx[t] = index of the episode boundary for step t.
+        def carry_nearest_boundary(nearest_boundary, step_input):
+            step, is_boundary = step_input
+            nearest_boundary = jnp.where(is_boundary, step, nearest_boundary)
+            return nearest_boundary, nearest_boundary
 
         _, end_idx = jax.lax.scan(
-            scan_end,
-            jnp.full((E,), S - 1, dtype=jnp.int32),
-            (step_idx, boundaries),
-            reverse=True,
+            carry_nearest_boundary,
+            init=jnp.full((E,), S - 1, dtype=jnp.int32),  # initial carry per env: fall back to last step if no boundary seen
+            xs=(step_idx, boundaries),  # scan along time axis: (step index, boundary flag) at each t
+            reverse=True,  # walk t = S-1 -> 0 
         )
 
         # Gumbel top-k over offsets in [0, S): samples k distinct offsets
         # without replacement, weighted by log_weights + Gumbel noise.
-        range_size = end_idx - step_idx + 1
+        range_size = end_idx - step_idx + 1 # shape: (S, E), number of valid future steps (including current step) for each (t, e)
         offsets_range = jnp.arange(S)
+        # Sample Gumbel noise for each (t, e, offset) candidate. Shape: (S, E, S)
         gumbel = -jnp.log(
             -jnp.log(jnp.clip(jax.random.uniform(key, (S, E, S)), 1e-20, 1.0 - 1e-7))
         )
-        # Uniform sampling: every future offset in the segment is equally likely.
-        log_weights = jnp.zeros(S)
+        # Uniform sampling
+        log_weights = jnp.zeros(S) # use zeros for uniform sampling
         scores = log_weights[None, None, :] + gumbel
         # Mask out offsets that reach past the episode boundary.
         valid_offsets = offsets_range[None, None, :] < range_size[:, :, None]
         scores = jnp.where(valid_offsets, scores, -1e9)
-        _, top_offsets = jax.lax.top_k(scores, k)
-        future_idx = step_idx[:, :, None] + top_offsets
+        _, top_offsets = jax.lax.top_k(scores, k) # shape: (S, E, k), offsets of the top-k scored future steps for each (t, e)
+        future_idx = step_idx[:, :, None] + top_offsets # indices of the sampled future steps; shape: (S, E, k)
 
         # A hindsight slot is valid if the segment had at least (j+1) future
         # steps. Invalid slots are zeroed out of the loss below.
         valid = jnp.arange(k)[None, None, :] < jnp.minimum(k, range_size)[:, :, None]
 
-        # Gather the achieved goal at each sampled future step; this is the
-        # hindsight goal for the (t, j) slot.
-        env_idx = jnp.broadcast_to(jnp.arange(E)[None, :, None], future_idx.shape)
+        # Gather the achieved goal at each sampled future step
+        env_idx = jnp.broadcast_to(jnp.arange(E)[None, :, None], future_idx.shape) # shape: (S, E, k), env indices for each (t, e, j) slot
+        # (t, e, j) refers to the j-th sampled future step for time step t in env e
+        # g_alt is the achieved goal at that future step, which becomes the hindsight goal for the (t, e, j) slot. Shape: (S, E, k, goal_dim)
         g_alt = batch.next_obs[future_idx, env_idx][..., goal_indices]
 
         # Splice g_alt into the trailing goal slots of obs and next_obs.
+        # shape: (S, E, k, obs_dim), batch.obs is broadcast along the new k dimension and g_alt is spliced in as the new goal
         obs_alt = replace_goal_in_obs(batch.obs[:, :, None, :], g_alt)
         next_obs_alt = replace_goal_in_obs(batch.next_obs[:, :, None, :], g_alt)
 
         # Hindsight reward is the sparse indicator for the new goal.
-        reward_alt = compute_goal_reward(batch.next_obs[:, :, None, :], g_alt)
+        reward_alt = compute_goal_reward(batch.next_obs[:, :, None, :], g_alt) # shape: (S, E, k)
 
-        # term marks intrinsic terminations only; time-limit truncations
-        # carry through as the truncated flag below so the TD bootstrap
-        # stays well-defined at time-limit boundaries.
+        # term marks intrinsic terminations only, not time limit truncations.
+        # brax sets done=1 at both intrinsic terminations and time-limit truncations.
+        # truncated=1 disambiguates the time-limit case.
         term = is_terminal(batch.done, batch.truncated)
         done_alt = jnp.broadcast_to(term[:, :, None], (S, E, k))
 
         trunc_alt = jnp.broadcast_to(batch.truncated[:, :, None], (S, E, k))
-        # Invalid slots are marked truncated=1 so (1 - truncated) zeros them in L_Q.
-        trunc_alt = jnp.where(valid, trunc_alt, 1.0)
 
         # Validity mask: 1 for valid hindsight slots, 0 for invalid ones
         # (which carry garbage future_idx data and must be excluded).
@@ -1092,6 +1127,9 @@ def train(args: Args):
     fusion_dim = args.critic_network_width
 
     def _actor_dist(params, obs):
+        """
+        Return the distrax distribution over actions for the given actor params and obs.
+        """
         mean, log_std = actor.apply(params, obs)
         return action_dist(mean, log_std)
 
@@ -1099,20 +1137,22 @@ def train(args: Args):
         return jnp.exp(actor_params["params"]["log_temperature"])
 
     def nstep_lambda(batch):
-        """Reverse-scan TD-lambda return using the max-entropy soft reward."""
+        """
+        Reverse-scan TD-lambda return using the max-entropy soft reward.
+        This function is only used for the original trajectory, not the hindsight trajectories
+        which use compute_alt_target below.
+        """
         def loop(returns, transition):
-            done = transition.done
+            truncated = transition.truncated
+            term = is_terminal(transition.done, truncated)
             reward = transition.extras["soft_reward"]
             next_value = transition.extras["next_value"]
-            truncated = transition.truncated
-            # Lambda mixes the upstream return (lambda) with the bootstrap
-            # V(next) (1 - lambda). lambda=1 recovers the Monte-Carlo
-            # return; lambda=0 recovers TD(0).
+
             lambda_sum = args.lmbda * returns + (1 - args.lmbda) * next_value
             # At a truncation (time-limit): bootstrap only.
-            # Otherwise: r_tilde + gamma * (1 - done) * lambda_sum.
+            # Otherwise: r_tilde + gamma * (1 - term) * lambda_sum.
             lambda_return = reward + args.gamma * jnp.where(
-                truncated, next_value, (1.0 - done) * lambda_sum
+                truncated, next_value, (1.0 - term) * lambda_sum
             )
             return lambda_return, lambda_return
 
@@ -1144,6 +1184,7 @@ def train(args: Args):
             boundary_mask[..., None],
             next_action,
             jnp.concatenate([batch.action[1:], next_action[-1:]], axis=0),
+            # shift batch.action by one step to get the t+1 action, and use next_action for the last step which has no t+1 action in the batch
         )
         true_next_action = jnp.clip(true_next_action, -1 + 1e-4, 1 - 1e-4)
         true_next_log_prob = next_pi.log_prob(true_next_action)
@@ -1181,23 +1222,6 @@ def train(args: Args):
         norm_state, g_alt, end_idx,
     ):
         """IS-corrected TD-lambda target for ONE hindsight slot j.
-
-        For each starting time t and each env, the target G_t^{alt,j} is built
-        over the remainder of the same episode segment [t, end_idx[t]] with:
-          * reward_u = 1{ ||achieved(next_obs_u) - g_alt|| < thresh }
-          * soft reward subtracts gamma * alpha * log pi under g_alt
-          * per-decision IS ratio
-              rho_{u+1} = min(1, pi(a_{u+1} | x_{u+1}, g_alt)
-                              / pi(a_{u+1} | x_{u+1}, g_orig))
-            corrects for the action mismatch between g_alt and g_orig
-          * at u = end_idx[t]: bootstrap only (truncation case uses V,
-            otherwise (1-term)*V)
-          * at u < end_idx[t] (interior):
-              G_u = r_tilde_u + gamma * (1 - term_u)
-                    * ((1 - lambda * rho) * V_u + lambda * rho * G_{u+1})
-
-        Implemented as a single reverse scan over u so peak memory is O(S*E)
-        rather than the O(S^2*E) of a naive per-t inner loop.
 
         Returns (stop_grad(G_final), mean_rho, stop_grad(next_emb_final)).
         """
@@ -1265,16 +1289,17 @@ def train(args: Args):
             log_rho = is_num_log - is_denom[None, :]
             rho = jnp.minimum(1.0, jnp.exp(log_rho))
 
-            # Terminal flags for step u. is_terminal zeros the entropy
-            # correction ONLY at intrinsic terminations, matching the
-            # jnp.where(trunc, V, (1-term)*V) bootstrap gate below.
-            term_u = raw_done[u]
+            # brax `done` is set at both intrinsic terminations and time-limit
+            # truncations; is_terminal strips the truncation case so `term_u`
+            # matches the standard RL convention used in the v6 pseudocode.
+            done_u = raw_done[u]
             trunc_u = raw_truncated[u]
-            term_mask = 1.0 - is_terminal(term_u, trunc_u)[None, :]
+            term_u = is_terminal(done_u, trunc_u)
+            term_mask = 1.0 - term_u[None, :]
 
             # Max-entropy correction at every step uses a fresh action sampled
             # under g_alt:
-            #   r_tilde_u = r_u - gamma * (1 - term_u*(1-trunc_u)) * e^alpha
+            #   r_tilde_u = r_u - gamma * (1 - term_u) * e^alpha
             #                         * log pi(a'_{u+1} | x_{u+1}, g_alt).
             soft_r = reward_u - args.gamma * alpha * term_mask * fresh_log_prob
 
