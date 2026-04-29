@@ -1,0 +1,21 @@
+# envs/thresholds.yaml
+# Per-env-class success threshold. Each value mirrors the literal
+# `dist < <threshold>` written in the env's `step` method. Each entry
+# is annotated with the env file:line so the source can be re-checked
+# by hand if anyone touches the env code.
+Ant: 0.5                      # envs/ant.py:143
+AntMaze: 0.5                  # envs/ant_maze.py:450
+AntMazeGeneralization: 0.5    # envs/ant_maze_generalization.py:345
+AntBall: 0.5                  # envs/ant_ball.py:154
+AntPush: 0.5                  # envs/ant_push.py:142
+Humanoid: 0.5                 # envs/humanoid.py:150
+HumanoidMaze: 0.5             # envs/humanoid_maze.py:264
+Reacher: 0.05                 # envs/reacher.py:87
+Pusher: 0.1                   # envs/pusher.py:123 (and :247 for arm-pusher path)
+ArmReach: 0.1                 # envs/manipulation/arm_reach.py:_compute_goal_completion (line 58)
+ArmPushEasy: 0.1              # envs/manipulation/arm_push_easy.py:60
+ArmPushHard: 0.1              # envs/manipulation/arm_push_hard.py:60
+ArmBinpickEasy: 0.1           # envs/manipulation/arm_binpick_easy.py:60
+ArmBinpickHard: 0.1           # envs/manipulation/arm_binpick_hard.py:60
+ArmBinpickEasyEEF: 0.1        # envs/manipulation/arm_binpick_easy_EEF.py:60
+ArmGrasp: 0.1                 # envs/manipulation/arm_grasp.py:_compute_goal_completion
