@@ -17,6 +17,7 @@ factory because the stagger code is orthogonal to the learning loop.
 """
 
 import functools
+import json
 import os
 import pickle
 import random
@@ -137,6 +138,9 @@ class Args:
     actor_skip_connections: int = 0      # reserved
     critic_skip_connections: int = 0     # reserved
     use_relu: int = 0                    # 0 => swish, 1 => relu (matches scaling-crl)
+
+    # --- env-0 transition logging (goal-buffer comparison study) ---
+    log_env0_transitions: bool = False
 
 
 # =============================================================================
@@ -1896,13 +1900,24 @@ def train(args: Args):
             "rollout/reward_mean": jnp.mean(rollout_reward),
             "rollout/reward_is_binary": rollout_reward_is_binary,
         }
+        if args.log_env0_transitions:
+            env0_chunk = {
+                "obs": transitions.obs[:, 0],
+                "action": transitions.action[:, 0],
+                "done": transitions.done[:, 0],
+                "truncated": transitions.truncated[:, 0],
+            }
+        else:
+            env0_chunk = {}
         state = state.replace(iteration=state.iteration + 1)
-        return state, metrics
+        return state, (metrics, env0_chunk)
 
     @jax.jit
     def training_epoch(train_state, keys):
         """Scan train_step for eval_interval iterations under a single jit."""
-        train_state, metrics = jax.lax.scan(train_step, train_state, keys)
+        train_state, (metrics, env0_chunks) = jax.lax.scan(
+            train_step, train_state, keys
+        )
         reduced = {}
         for k, v in metrics.items():
             if k.startswith("rollout/"):
@@ -1911,7 +1926,7 @@ def train(args: Args):
                 reduced[f"{k}_mean"] = jnp.mean(v)
             else:
                 reduced[k] = v[-1]
-        return train_state, reduced
+        return train_state, reduced, env0_chunks
 
     # --- Eval wiring (CrlEvaluator) --------------------------------------
     def deterministic_actor_step(training_state: ReppoTrainingState, env_, env_state, extra_fields=()):
@@ -1931,12 +1946,26 @@ def train(args: Args):
             extras={"state_extras": state_extras},
         )
 
-    # --- Checkpointing helpers ------------------------------------------
-    save_dir = Path(args.wandb_dir) / "checkpoints" / args.exp_name
-    save_dir.mkdir(parents=True, exist_ok=True)
+    # --- Run dir + checkpointing helpers ---------------------------------
+    # Layout (mirrors train.py:313 convention):
+    #   {wandb_dir}/runs/reppo/{env_id}_{seed}_{datetime}/
+    #     checkpoints/  step_<step>.pkl + final.pkl + args.pkl
+    #     transitions/  meta.json + iter_<i>_step_<n>.npz (env-0 logger)
+    save_path = None
+    if args.checkpoint or args.log_env0_transitions:
+        short_run_name = (
+            f"runs/reppo/{args.env_id}_{args.seed}_"
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        save_path = Path(args.wandb_dir) / Path(short_run_name)
+        save_path.mkdir(parents=True, exist_ok=True)
+        if args.checkpoint:
+            (save_path / "checkpoints").mkdir(parents=True, exist_ok=True)
+        if args.log_env0_transitions:
+            (save_path / "transitions").mkdir(parents=True, exist_ok=True)
 
     def checkpoint(train_state: ReppoTrainingState, tag: str):
-        """Pickle actor/critic/target/normalizer params to save_dir/step_<tag>.pkl."""
+        """Pickle actor/critic/target/normalizer params to checkpoints/step_<tag>.pkl."""
         if not args.checkpoint:
             return
         params = (
@@ -1945,7 +1974,7 @@ def train(args: Args):
             train_state.actor_target_params,
             train_state.normalization_state,
         )
-        path = str(save_dir / f"step_{tag}.pkl")
+        path = str(save_path / "checkpoints" / f"step_{tag}.pkl")
         save_params(path, params)
 
     # --- capture_vis -----------------------------------------------------
@@ -2011,11 +2040,30 @@ def train(args: Args):
     if wandb.run is not None and args.wandb_mode == "offline":
         trigger_sync = TriggerWandbSyncHook()
 
+    # env-0 transition logging for the goal-buffer comparison study.
+    if args.log_env0_transitions:
+        env0_dir = save_path / "transitions"
+        meta = {
+            "algo": "reppo",
+            "env_id": args.env_id,
+            "seed": args.seed,
+            "num_envs": args.num_envs,
+            "logged_env_index": 0,
+            "num_steps_per_iter": args.num_steps,
+            "eval_interval": eval_interval,
+            "obs_dim": int(args.obs_dim),
+            "action_dim": int(action_size),
+            "goal_start_idx": int(args.goal_start_idx),
+            "goal_end_idx": int(args.goal_end_idx),
+            "obs_is_normalized": False,
+        }
+        (env0_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+
     training_walltime = 0.0
     for eval_epoch in range(num_evals):
         t = time.time()
         epoch_key, key = jax.random.split(key)
-        train_state, train_metrics = training_epoch(
+        train_state, train_metrics, env0_chunk = training_epoch(
             train_state, jax.random.split(epoch_key, eval_interval)
         )
         jax.tree_util.tree_map(lambda x: x.block_until_ready(), train_metrics)
@@ -2030,6 +2078,22 @@ def train(args: Args):
             "training/env_steps": env_step_count,
             **{f"training/{k}": v for k, v in train_metrics.items()},
         }
+
+        if args.log_env0_transitions:
+            obs_np = np.asarray(env0_chunk["obs"]).reshape(-1, int(args.obs_dim))
+            action_np = np.asarray(env0_chunk["action"]).reshape(-1, int(action_size))
+            done_np = np.asarray(env0_chunk["done"]).reshape(-1).astype(bool)
+            trunc_np = np.asarray(env0_chunk["truncated"]).reshape(-1).astype(bool)
+            chunk_path = env0_dir / (
+                f"iter_{eval_epoch:05d}_step_{env_step_count:09d}.npz"
+            )
+            np.savez_compressed(
+                chunk_path,
+                obs=obs_np,
+                action=action_np,
+                done=done_np,
+                truncated=trunc_np,
+            )
 
         metrics = evaluator.run_evaluation(train_state, training_metrics)
         log_metrics(env_step_count, eval_epoch, metrics)
@@ -2046,9 +2110,18 @@ def train(args: Args):
         if trigger_sync is not None:
             trigger_sync()
 
-    # Final checkpoint + optional capture_vis
+    # Final checkpoint + args.pkl + optional capture_vis
     final_env_step = int(train_state.env_steps)
-    checkpoint(train_state, tag=f"final_{final_env_step}")
+    if args.checkpoint:
+        params = (
+            train_state.actor_state.params,
+            train_state.critic_state.params,
+            train_state.actor_target_params,
+            train_state.normalization_state,
+        )
+        save_params(str(save_path / "checkpoints" / "final.pkl"), params)
+        with open(save_path / "checkpoints" / "args.pkl", "wb") as f:
+            pickle.dump(args, f)
     if args.capture_vis:
         capture_vis_to_wandb(train_state, step=final_env_step)
         if trigger_sync is not None:
