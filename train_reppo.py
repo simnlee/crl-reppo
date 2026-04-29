@@ -1012,8 +1012,9 @@ def train(args: Args):
 
     def replace_goal_in_obs(obs, new_goal):
         """Replace last goal_dim dims of obs with new_goal."""
-        obs = jnp.broadcast_to(obs, new_goal.shape[:-1] + (obs.shape[-1],))
-        return obs.at[..., -goal_dim:].set(new_goal)
+        state = obs[..., :-goal_dim]
+        state = jnp.broadcast_to(state, new_goal.shape[:-1] + (state.shape[-1],))
+        return jnp.concatenate([state, new_goal], axis=-1)
 
     def compute_goal_reward(next_obs_raw, goal):
         """Sparse reward: 1 if achieved state is within threshold of goal."""
