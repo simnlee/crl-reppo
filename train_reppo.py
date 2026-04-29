@@ -121,7 +121,6 @@ class Args:
 
     # --- HER ---
     her_k: int = 4
-    her_goal_sampling: str = "uniform"   # 'uniform'|'geometric'
 
     # --- Stagger ---
     stagger_envs: bool = False
@@ -1033,8 +1032,8 @@ def train(args: Args):
 
         For each step t in each env, sample k indices from the remaining
         segment [t, end_idx[t]] (up to episode boundary), and take the
-        achieved goal at each sampled step as a hindsight goal. Supports
-        uniform or geometric sampling over future offsets. Slots with fewer
+        achieved goal at each sampled step as a hindsight goal. Uses
+        uniform sampling over future offsets. Slots with fewer
         than k available future steps are marked with valid_mask=0 and
         truncated=1 so they are zeroed out of the critic loss.
 
@@ -1068,13 +1067,8 @@ def train(args: Args):
         gumbel = -jnp.log(
             -jnp.log(jnp.clip(jax.random.uniform(key, (S, E, S)), 1e-20, 1.0 - 1e-7))
         )
-        if args.her_goal_sampling == "geometric":
-            # Geometric weighting log_w = offset * log(gamma) biases toward
-            # near-term future steps (more weight on small offsets).
-            log_weights = offsets_range * jnp.log(args.gamma)
-        else:
-            # Uniform sampling: every future offset in the segment is equally likely.
-            log_weights = jnp.zeros(S)
+        # Uniform sampling: every future offset in the segment is equally likely.
+        log_weights = jnp.zeros(S)
         scores = log_weights[None, None, :] + gumbel
         # Mask out offsets that reach past the episode boundary.
         valid_offsets = offsets_range[None, None, :] < range_size[:, :, None]
