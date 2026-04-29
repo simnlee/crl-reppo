@@ -1,32 +1,12 @@
-"""
-Section order (top-to-bottom):
-  imports (incl. `from train import` for shared CRL scaffolding: lecun_unfirom,
-  bias_init, residual_block, Transition, load_params, save_params) -> Args
-  -> Normalizer -> AutoResetWrapper/wrap_for_training -> hl_gauss
-  -> prefix_dict/log_metrics -> networks (Actor, Critic, action_dist)
-  -> make_env -> RolloutTransition -> is_terminal -> stagger helpers
-  -> ReppoTrainingState -> train(args) [contains: env+network+optimizer setup,
-     HER helpers, TD-lambda helpers, losses + epoch runner, init_train_state,
-     collect_rollout, learner_fn, train_step, training_epoch, eval wiring,
-     checkpointing, capture_vis] -> main.
-
-All algorithm closures live inside ``train(args)`` and capture ``args``,
-``actor``, ``critic``, ``normalizer``, ``goal_indices`` etc. from its enclosing
-scope. The single exception is ``make_stagger_helpers``, which stays a top-level
-factory because the stagger code is orthogonal to the learning loop.
-"""
-
 import functools
 import json
-import os
 import pickle
 import random
-import sys
 import time
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import distrax
 import flax
@@ -38,13 +18,11 @@ import numpy as np
 import optax
 import tyro
 import wandb
-import wandb_osh
 import yaml
 from brax import envs
 from brax.envs.base import PipelineEnv, State, Wrapper
 from brax.envs.wrappers.training import EpisodeWrapper, VmapWrapper
 from brax.io import html
-from etils import epath
 from flax.training.train_state import TrainState
 from wandb_osh.hooks import TriggerWandbSyncHook
 
@@ -82,14 +60,14 @@ class Args:
 
     # --- env ---
     env_id: str = "ant"
-    eval_env_id: str = ""              # empty => falls back to env_id
+    eval_env_id: str = "" # empty => falls back to env_id
     episode_length: int = 1000
     action_repeat: int = 1
     # filled at runtime by make_env:
     obs_dim: int = 0
-    goal_start_idx: int = 0
+    goal_start_idx: int = 0 # achieved goal is in obs[goal_start_idx:goal_end_idx]
     goal_end_idx: int = 0
-    success_thresh: float = 0.0
+    success_thresh: float = 0.0 # env-specific distance threshold for success, loaded from envs/thresholds.yaml
 
     # --- REPPO training sizes ---
     num_envs: int = 1024
@@ -101,7 +79,7 @@ class Args:
     total_time_steps: int = 100_000_000
 
     # --- REPPO LR + schedule ---
-    actor_lr: float = 6e-4
+    actor_lr: float = 3e-4
     critic_lr: float = 3e-4
     anneal_lr: bool = False
     max_grad_norm: float = 0.5
@@ -124,7 +102,7 @@ class Args:
 
     # --- Stagger ---
     stagger_envs: bool = False
-    stagger_step_size: int = 0           # 0 sentinel => num_steps
+    stagger_step_size: int = 0
     stagger_mode: str = "grouped"
     stagger_debug: bool = False
 
@@ -133,9 +111,9 @@ class Args:
     actor_depth: int = 32
     critic_network_width: int = 256
     critic_depth: int = 32
-    actor_skip_connections: int = 0      # reserved
-    critic_skip_connections: int = 0     # reserved
-    use_relu: int = 0                    # 0 => swish, 1 => relu (matches scaling-crl)
+    actor_skip_connections: int = 0 # unused, copied from CRL repo for future exploration of skip connections in the actor
+    critic_skip_connections: int = 0 # reserved, copied from CRL repo for future exploration of skip connections in the critic
+    use_relu: int = 0 # 0 => swish, 1 => relu (from CRL repo)
 
     # --- env-0 transition logging (goal-buffer comparison study) ---
     log_env0_transitions: bool = False
