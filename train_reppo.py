@@ -98,19 +98,17 @@ class Args:
     aux_loss_coeff: float = 0.0
 
     # --- HER ---
-    her_k: int = 4
+    her_k: int = 1
 
     # --- Stagger ---
-    stagger_envs: bool = False
-    stagger_step_size: int = 0
-    stagger_mode: str = "grouped"
-    stagger_debug: bool = False
+    stagger_envs: bool = True
+    stagger_debug: bool = True
 
     # --- Networks (depth-scaling axis follows scaling-crl) ---
     actor_network_width: int = 256
-    actor_depth: int = 32
+    actor_depth: int = 4
     critic_network_width: int = 256
-    critic_depth: int = 32
+    critic_depth: int = 4
     actor_skip_connections: int = 0 # unused, copied from CRL repo for future exploration of skip connections in the actor
     critic_skip_connections: int = 0 # reserved, copied from CRL repo for future exploration of skip connections in the critic
     use_relu: int = 0 # 0 => swish, 1 => relu (from CRL repo)
@@ -681,9 +679,7 @@ def compute_stagger_schedule(args: "Args"):
     Used by :func:`make_stagger_helpers` to partition envs into groups for
     the initial offset warmup.
     """
-    step_size = int(args.stagger_step_size) if args.stagger_step_size else int(args.num_steps)
-    if step_size <= 0:
-        raise ValueError(f"stagger_step_size must be positive, got {step_size}.")
+    step_size = int(args.num_steps)
     episode_length = int(args.episode_length)
     num_groups = max(-(-episode_length // step_size), 1)
     group_idx = jnp.arange(int(args.num_envs), dtype=jnp.int32) % num_groups
@@ -806,12 +802,6 @@ def make_stagger_helpers(args: "Args", env):
         """Advance envs to staggered rollout offsets before training starts."""
         if not args.stagger_envs:
             return env_state, {"enabled": False}
-
-        if args.stagger_mode != "grouped":
-            raise ValueError(
-                f"Unsupported stagger_mode={args.stagger_mode!r}; "
-                "only 'grouped' is implemented."
-            )
 
         stagger_step_size, num_groups, group_idx = compute_stagger_schedule(args)
         max_offset = (num_groups - 1) * stagger_step_size
