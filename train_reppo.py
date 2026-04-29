@@ -126,7 +126,6 @@ class Args:
     stagger_envs: bool = False
     stagger_step_size: int = 0           # 0 sentinel => num_steps
     stagger_mode: str = "grouped"
-    stagger_warmup_policy: str = "random"
     stagger_debug: bool = False
 
     # --- Networks (depth-scaling axis follows scaling-crl) ---
@@ -834,11 +833,6 @@ def make_stagger_helpers(args: "Args", env):
             raise ValueError(
                 f"Unsupported stagger_mode={args.stagger_mode!r}; "
                 "only 'grouped' is implemented."
-            )
-        if args.stagger_warmup_policy != "random":
-            raise ValueError(
-                f"Unsupported stagger_warmup_policy={args.stagger_warmup_policy!r}; "
-                "only 'random' is implemented."
             )
 
         stagger_step_size, num_groups, group_idx = compute_stagger_schedule(args)
