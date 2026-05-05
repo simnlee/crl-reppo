@@ -1553,8 +1553,8 @@ def train(args: Args):
         mini_batch_size = (args.num_steps * args.num_envs) // args.num_mini_batches
         num_minibatches = batch_size // mini_batch_size
         key, shuffle_key, act_key, kl_key = jax.random.split(key, 4)
-        indices = jax.random.permutation(shuffle_key, batch_size)
-        minibatch_idxs = indices.reshape((num_minibatches, mini_batch_size))
+        indices = jax.random.permutation(shuffle_key, batch_size) # shape: (batch_size,), shuffled indices of all samples in the batch
+        minibatch_idxs = indices.reshape((num_minibatches, mini_batch_size)) # shape: (num_minibatches, mini_batch_size), indices of the samples in each minibatch
         minibatches = jax.tree_util.tree_map(
             lambda x: jnp.take(x, minibatch_idxs, axis=0), batch
         )
@@ -1570,7 +1570,7 @@ def train(args: Args):
         metrics_mean = jax.tree_util.tree_map(lambda x: x.mean(0), metrics)
         return train_state, metrics_mean
 
-    # === Stagger helpers (factory stays — orthogonal to algorithm) ===
+    # === Stagger helpers ===
     (
         select_active_envs,
         stagger_env_state,
@@ -1751,7 +1751,7 @@ def train(args: Args):
 
         def _alt_target_for_one_slot(rng, g_alt_one_slot):
             rng, slot_key = jax.random.split(rng)
-            tv, mean_rho, next_emb = compute_alt_target(
+            tv, mean_rho, next_emb = compute_alt_target( # mean_rho is logged for debugging
                 key=slot_key,
                 train_state=train_state,
                 raw_obs=raw_obs,
@@ -1765,6 +1765,9 @@ def train(args: Args):
             )
             return rng, (tv, mean_rho, next_emb)
 
+        # scan over the k hindsight slots in parallel; each slot's alt goal is
+        # drawn independently, so the RNG is split at each slot. The scan's
+        # carry is just the RNG since compute_alt_target returns all outputs via the scan's mapped output.
         _, (target_values_alt_per_slot, mean_rho_per_slot, next_emb_alt_per_slot) = (
             jax.lax.scan(
                 _alt_target_for_one_slot,
@@ -1783,6 +1786,8 @@ def train(args: Args):
         batch.extras["valid_mask"] = jnp.ones(
             batch.obs.shape[:-1], dtype=jnp.float32
         )
+        # flatten batch from (S, E, obs_dim) to (N, obs_dim), where N=S*E is the total number of samples in the batch
+        # extras with shape (S, E, ...) are flattened to (N, ...), e.g. target_values with shape (S, E) becomes (N,)
         orig_flat = jax.tree_util.tree_map(
             lambda x: x.reshape((N, *x.shape[2:])), batch
         )
