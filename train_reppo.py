@@ -115,6 +115,20 @@ class Args:
     # --- env-0 transition logging ---
     log_env0_transitions: bool = False
 
+    # --- OMEGA goal sampling ---
+    use_omega: bool = True
+    omega_b: float = -3.0             # bias b_Omega in omega_coeff = 1 / max(b + KL, 1)
+    omega_K_B: int = 2                # FIFO buffer iter window; capacity = K_B * num_envs * num_steps
+    omega_warmup_steps: int = 5       # random-action scan steps; each inserts num_envs achieved goals
+    omega_horizon: int = 0            # H_Omega; 0 => derive from args.episode_length (matches MEGA paper convention max_steps=episode_length)
+    omega_cutoff_step: float = 1.0    # Delta_Omega; cutoff up/down step size; matches mrl/modules/curiosity.py (cutoff +/- 1.0 per adapt)
+    omega_N: int = 100                # N_Omega; MegaSelect candidate count per env
+    omega_L: int = 1                  # L_Omega; action samples per candidate Q-estimate
+    omega_N_KL: int = 1000            # N_KL; KL estimator sample count
+    omega_N_dens: int = 1000          # N_dens; KDE-fitting sample count
+    omega_density_floor: float = 1e-4 # epsilon_dens; floor on KDE log-densities
+    omega_kde_bandwidth: float = 0.1  # bandwidth for both Gaussian KDEs (pseudocode lines 89, 92)
+
 
 # =============================================================================
 # Normalizer
@@ -684,6 +698,41 @@ def is_terminal(done, truncated):
     return done * (1.0 - truncated)
 
 
+@struct.dataclass
+class OmegaState:
+    """State for OMEGA goal sampling (v7b). See plans/algorithms/reppo_gcrl_algorithm_v7b.md."""
+    # FIFO buffer of achieved goals from recent rollouts.
+    goal_buffer: jax.Array       # (C_B, goal_dim)
+    goal_buffer_idx: jax.Array   # int32 scalar; next write position mod C_B
+    goal_buffer_size: jax.Array  # int32 scalar; min(total inserted, C_B)
+
+    # Static p_g sample pool, populated once at training init from env_state.obs
+    # right after env.reset() (each entry is a fresh sample from the env's goal dist).
+    pg_samples: jax.Array        # (num_envs, goal_dim)
+
+    # Currently fitted KDE state (re-derived on each refit_omega_density).
+    ag_samples: jax.Array        # (N_dens, goal_dim) normalized achieved-goal samples
+    dg_samples: jax.Array        # (N_dens, goal_dim) normalized desired-goal samples
+    mu_G: jax.Array              # (goal_dim,)
+    sigma_G: jax.Array           # (goal_dim,)
+    omega_coeff: jax.Array       # scalar
+
+    # Cutoff dynamics.
+    cutoff: jax.Array            # scalar c_Omega
+    cutoff_min: jax.Array        # scalar c_Omega^min
+
+    # Behavior-goal success ring buffer (size 10, matching pseudocode).
+    behavior_history: jax.Array       # (10,) float32
+    behavior_history_idx: jax.Array   # int32 scalar
+    behavior_history_count: jax.Array # int32 scalar (capped at 10)
+
+    # Per-env episode-segment state (carries across rollout iterations).
+    current_goals: jax.Array     # (num_envs, goal_dim) chosen g_orig per env
+    current_qmin: jax.Array      # (num_envs,) q^Omega_min from this env's last goal-selection
+    current_success: jax.Array   # (num_envs,) chi_Omega per env, 0/1 float
+    prev_done: jax.Array         # (num_envs,) bool; True => start a new segment this step
+
+
 # =============================================================================
 # Stagger helpers
 # =============================================================================
@@ -907,6 +956,8 @@ class ReppoTrainingState:
     actor_target_params: Any
     normalization_state: NormalizationState
     last_env_state: State
+    # OMEGA goal sampling state. None when args.use_omega is False.
+    omega_state: Any = None
 
 
 # =============================================================================
@@ -1578,6 +1629,204 @@ def train(args: Args):
         maybe_print_stagger_debug_summary,
     ) = make_stagger_helpers(args, env)
 
+    # === OMEGA goal sampling helpers (only built when args.use_omega) ===
+    if args.use_omega:
+        # MEGA paper convention: max_steps = episode_length. Allow override via
+        # args.omega_horizon > 0 for ablation; sentinel 0 means "match episode_length".
+        H_omega = args.omega_horizon if args.omega_horizon > 0 else args.episode_length
+        C_omega_full = (1.0 - args.gamma**H_omega) / (1.0 - args.gamma)
+        c_omega_init = float(C_omega_full - 3.0)
+        omega_C_B = args.omega_K_B * args.num_envs * args.num_steps # capacity of the FIFO buffer for achieved goals, which is all achieved goals from the last omega_K_B epochs
+        omega_log_eps = float(np.log(args.omega_density_floor))
+
+        def gaussian_kde_log_density(samples, query_points):
+            """Gaussian KDE log p(query) given samples (both already normalized)."""
+            h = args.omega_kde_bandwidth
+            d = samples.shape[-1]
+            N = samples.shape[0]
+            diffs = query_points[:, None, :] - samples[None, :, :]  # (Q, N, d)
+            log_kernel = -jnp.sum(diffs * diffs, axis=-1) / (2.0 * h * h)
+            log_norm = -jnp.log(N) - 0.5 * d * jnp.log(2.0 * jnp.pi * h * h)
+            return jax.scipy.special.logsumexp(log_kernel, axis=-1) + log_norm
+
+        def _insert_into_goal_buffer(omega_state, new_goals):
+            """Push num_envs achieved goals into the FIFO buffer."""
+            E = new_goals.shape[0]
+            idxs = (omega_state.goal_buffer_idx + jnp.arange(E)) % omega_C_B
+            new_buffer = omega_state.goal_buffer.at[idxs].set(new_goals)
+            new_idx = (omega_state.goal_buffer_idx + E) % omega_C_B
+            new_size = jnp.minimum(omega_state.goal_buffer_size + E, omega_C_B)
+            return omega_state.replace(
+                goal_buffer=new_buffer,
+                goal_buffer_idx=new_idx,
+                goal_buffer_size=new_size,
+            )
+
+        def refit_omega_density(rng, omega_state):
+            """Re-fit p_ag, p_g, recompute omega_coeff. Pseudocode lines 67-111."""
+            rng, k_ag, k_dg, k_kl = jax.random.split(rng, 4)
+            # Sample N_dens achieved goals from buffer.
+            ag_idx = jax.random.randint(
+                k_ag, (args.omega_N_dens,), 0,
+                jnp.maximum(omega_state.goal_buffer_size, 1),
+            )
+            ag_raw = omega_state.goal_buffer[ag_idx]
+            mu_G = jnp.mean(ag_raw, axis=0)
+            sigma_G = jnp.std(ag_raw, axis=0) + 1e-4
+            ag_samples = (ag_raw - mu_G) / sigma_G
+            # Sample N_dens desired goals from p_g pool, normalize with achieved-goal stats.
+            dg_idx = jax.random.randint(k_dg, (args.omega_N_dens,), 0, args.num_envs)
+            dg_samples = (omega_state.pg_samples[dg_idx] - mu_G) / sigma_G
+            # KL estimator: N_KL fresh h ~ p_g.
+            kl_idx = jax.random.randint(k_kl, (args.omega_N_KL,), 0, args.num_envs)
+            h_norm = (omega_state.pg_samples[kl_idx] - mu_G) / sigma_G
+            log_pg_h = jnp.maximum(gaussian_kde_log_density(dg_samples, h_norm), omega_log_eps)
+            log_pag_h = jnp.maximum(gaussian_kde_log_density(ag_samples, h_norm), omega_log_eps)
+            kl = jnp.mean(log_pg_h - log_pag_h)
+            omega_coeff = 1.0 / jnp.maximum(args.omega_b + kl, 1.0)
+            return omega_state.replace(
+                ag_samples=ag_samples,
+                dg_samples=dg_samples,
+                mu_G=mu_G,
+                sigma_G=sigma_G,
+                omega_coeff=omega_coeff,
+            )
+
+        def _q_for_goals(rng, x, goals, train_state):
+            """Mean critic Q over L_omega action samples from the behavior policy.
+
+            x: (E, obs_size). goals: (E, goal_dim) or (E, N, goal_dim). Returns
+            (E,) or (E, N) of mean Q values.
+            """
+            if goals.ndim == 2:
+                cand_obs = replace_goal_in_obs(x, goals)             # (E, obs_size)
+                shape_prefix = (x.shape[0],)
+            else:
+                cand_obs = replace_goal_in_obs(x[:, None, :], goals) # (E, N, obs_size)
+                shape_prefix = (x.shape[0], goals.shape[1])
+            L = args.omega_L
+            cand_obs_rep = jnp.broadcast_to(
+                cand_obs[..., None, :], shape_prefix + (L, cand_obs.shape[-1])
+            )
+            flat_obs = cand_obs_rep.reshape(-1, cand_obs.shape[-1])
+            flat_obs_norm = normalizer.normalize(train_state.normalization_state, flat_obs)
+            pi = _actor_dist(train_state.actor_state.params, flat_obs_norm)
+            flat_actions = jnp.clip(pi.sample(seed=rng), -1 + 1e-4, 1 - 1e-4)
+            critic_out = critic.apply(
+                train_state.critic_state.params, flat_obs_norm, flat_actions
+            )
+            return critic_out["value"].reshape(shape_prefix + (L,)).mean(axis=-1)
+
+        def mega_select(rng, x, omega_state, train_state):
+            """MegaSelect, vectorized over envs.
+
+            Returns (chosen: (E, goal_dim), q_min: (E,)).
+            """
+            E = x.shape[0]
+            N = args.omega_N
+            rng, k_idx, k_q = jax.random.split(rng, 3)
+            cand_idx = jax.random.randint(
+                k_idx, (E, N), 0, jnp.maximum(omega_state.goal_buffer_size, 1)
+            )
+            candidates = omega_state.goal_buffer[cand_idx]            # (E, N, goal_dim)
+            q = _q_for_goals(k_q, x, candidates, train_state)         # (E, N)
+            q_min = q.min(axis=-1)
+            # Viable = Q >= cutoff; fall back to argmax row when none viable.
+            viable = q >= omega_state.cutoff # remove candidates with Q < dynamic cutoff
+            has_viable = viable.any(axis=-1)
+            argmax_q = jnp.argmax(q, axis=-1)
+            fallback = jax.nn.one_hot(argmax_q, N).astype(jnp.bool_) # if no candidates are viable, fallback to the one with max Q
+            viable = jnp.where(has_viable[:, None], viable, fallback)
+            # Pick min KDE log-density among viable.
+            cand_norm = (candidates - omega_state.mu_G) / omega_state.sigma_G
+            flat_cand = cand_norm.reshape(-1, goal_dim)
+            log_dens = gaussian_kde_log_density(omega_state.ag_samples, flat_cand)
+            log_dens = jnp.maximum(log_dens, omega_log_eps).reshape(E, N)
+            masked = jnp.where(viable, log_dens, jnp.inf)
+            sel_idx = jnp.argmin(masked, axis=-1)
+            selected = jnp.take_along_axis(
+                candidates, sel_idx[:, None, None], axis=1
+            ).squeeze(1)
+            return selected, q_min
+
+        def omega_select(rng, x, g_ext, omega_state, train_state):
+            """Pseudocode OmegaSelect: keep g_ext with prob omega_coeff if Q >= cutoff."""
+            rng, k_mega, k_q, k_z = jax.random.split(rng, 4)
+            g_mega, q_min = mega_select(k_mega, x, omega_state, train_state)
+            q_ext = _q_for_goals(k_q, x, g_ext, train_state)
+            z = jax.random.uniform(k_z, (x.shape[0],))
+            use_ext = (z < omega_state.omega_coeff) & (q_ext >= omega_state.cutoff)
+            chosen = jnp.where(use_ext[:, None], g_ext, g_mega)
+            return chosen, q_min
+
+        def update_omega_cutoff(omega_state, just_completed_mask):
+            """Pseudocode UpdateOmegaCutoff. Called once per rollout scan step."""
+            # 1. Append per-env current_success to behavior_history ring.
+            cumsum = jnp.cumsum(just_completed_mask.astype(jnp.int32))
+            num_completed = cumsum[-1]
+            target = (omega_state.behavior_history_idx + cumsum - 1) % 10
+            new_history = omega_state.behavior_history.at[target].set(
+                jnp.where(
+                    just_completed_mask,
+                    omega_state.current_success,
+                    omega_state.behavior_history[target],
+                ),
+                mode="drop",
+            )
+            new_idx = (omega_state.behavior_history_idx + num_completed) % 10
+            new_count = jnp.minimum(
+                omega_state.behavior_history_count + num_completed, 10
+            )
+            # 2. Update cutoff_min.
+            masked_qmin = jnp.where(just_completed_mask, omega_state.current_qmin, jnp.inf)
+            batch_qmin = jnp.min(masked_qmin)
+            any_completed = num_completed > 0
+            new_cutoff_min = jnp.where(
+                any_completed,
+                jnp.minimum(batch_qmin, omega_state.cutoff_min),
+                omega_state.cutoff_min,
+            )
+            # 3. Adapt cutoff if count >= 10.
+            s = jnp.mean(new_history)
+            delta = args.omega_cutoff_step
+            cutoff_high = jnp.maximum(omega_state.cutoff - delta, new_cutoff_min)
+            cutoff_low = jnp.minimum(omega_state.cutoff + delta, c_omega_init)
+            adapt = new_count >= 10
+            new_cutoff = jnp.where(
+                adapt & (s >= 0.7),
+                cutoff_high,
+                jnp.where(adapt & (s <= 0.3), cutoff_low, omega_state.cutoff),
+            )
+            adapted = adapt & ((s >= 0.7) | (s <= 0.3))
+            new_count = jnp.where(adapted, jnp.int32(0), new_count)
+            return omega_state.replace(
+                behavior_history=new_history,
+                behavior_history_idx=new_idx,
+                behavior_history_count=new_count,
+                cutoff=new_cutoff,
+                cutoff_min=new_cutoff_min,
+            )
+
+        def omega_warmup(rng, env_state, omega_state):
+            """Random-action warmup; each scan step inserts num_envs achieved goals."""
+            def step(carry, _):
+                rng, env_state, omega_state = carry
+                rng, act_key = jax.random.split(rng)
+                actions = jax.random.uniform(
+                    act_key, (args.num_envs, action_size),
+                    minval=-1.0 + 1e-4, maxval=1.0 - 1e-4,
+                )
+                next_env_state = env.step(env_state, actions)
+                achieved = next_env_state.info["raw_obs"][..., goal_indices]
+                omega_state = _insert_into_goal_buffer(omega_state, achieved)
+                return (rng, next_env_state, omega_state), None
+
+            (rng, env_state, omega_state), _ = jax.lax.scan(
+                step, (rng, env_state, omega_state),
+                xs=None, length=args.omega_warmup_steps,
+            )
+            return env_state, omega_state
+
     # --- init_train_state -------------------------------------------------
     def init_train_state(key: jax.random.PRNGKey) -> ReppoTrainingState:
         key, actor_key, critic_key, env_key, stagger_key = jax.random.split(key, 5)
@@ -1609,6 +1858,34 @@ def train(args: Args):
             )
             maybe_print_stagger_debug_summary(env_state, stagger_info)
 
+        omega_state = None
+        if args.use_omega:
+            key, warmup_key, refit_key = jax.random.split(key, 3)
+            # pg_samples are env's just-sampled goals from the num_envs resets above.
+            initial_pg = env_state.obs[..., -goal_dim:]
+            omega_state = OmegaState(
+                goal_buffer=jnp.zeros((omega_C_B, goal_dim), dtype=jnp.float32),
+                goal_buffer_idx=jnp.int32(0),
+                goal_buffer_size=jnp.int32(0),
+                pg_samples=initial_pg,
+                ag_samples=jnp.zeros((args.omega_N_dens, goal_dim), dtype=jnp.float32),
+                dg_samples=jnp.zeros((args.omega_N_dens, goal_dim), dtype=jnp.float32),
+                mu_G=jnp.zeros((goal_dim,), dtype=jnp.float32),
+                sigma_G=jnp.ones((goal_dim,), dtype=jnp.float32),
+                omega_coeff=jnp.float32(0.0),
+                cutoff=jnp.float32(c_omega_init),
+                cutoff_min=jnp.float32(c_omega_init),
+                behavior_history=jnp.zeros((10,), dtype=jnp.float32),
+                behavior_history_idx=jnp.int32(0),
+                behavior_history_count=jnp.int32(0),
+                current_goals=initial_pg,
+                current_qmin=jnp.zeros((args.num_envs,), dtype=jnp.float32),
+                current_success=jnp.zeros((args.num_envs,), dtype=jnp.float32),
+                prev_done=jnp.ones((args.num_envs,), dtype=jnp.bool_),
+            )
+            env_state, omega_state = omega_warmup(warmup_key, env_state, omega_state)
+            omega_state = refit_omega_density(refit_key, omega_state)
+
         return ReppoTrainingState(
             env_steps=jnp.int32(0),
             iteration=jnp.int32(0),
@@ -1617,6 +1894,7 @@ def train(args: Args):
             actor_target_params=actor_params,
             normalization_state=normalization_state,
             last_env_state=env_state,
+            omega_state=omega_state,
         )
 
     # --- Policy + rollout -------------------------------------------------
@@ -1634,25 +1912,88 @@ def train(args: Args):
         range, step the env, and emit a RolloutTransition. ``next_obs`` is
         the env's ``raw_obs`` (pre-auto-reset next observation), so HER can
         still read the true achieved goal even on ticks that just terminated.
+
+        When ``args.use_omega`` is True, the env's natively-sampled goal is
+        overridden with an OMEGA-chosen ``g_orig`` per env per episode segment;
+        the sparse reward is recomputed against that chosen goal; and the
+        OMEGA state (FIFO buffer, cutoff, behavior history, per-env episode
+        flags) is updated in lockstep with the rollout.
         """
         def step_env(carry, _):
-            key, env_state = carry
-            key, act_key = jax.random.split(key)
-            action = policy(act_key, env_state.obs, train_state)
+            if args.use_omega:
+                key, env_state, omega_state = carry
+                key, sel_key, act_key = jax.random.split(key, 3)
+
+                is_new_segment = omega_state.prev_done                   # (E,)
+                g_ext = env_state.obs[..., -goal_dim:]                   # (E, goal_dim)
+                proposed_goal, proposed_qmin = omega_select(
+                    sel_key, env_state.obs, g_ext, omega_state, train_state
+                )
+                # Keep a chosen goal for the duration of an episode segment:
+                # only adopt the freshly-proposed one when the previous step
+                # ended an episode (or on the very first scan step, which init
+                # seeds with prev_done=True for every env).
+                chosen_goal = jnp.where(
+                    is_new_segment[:, None], proposed_goal, omega_state.current_goals
+                )
+                chosen_qmin = jnp.where(
+                    is_new_segment, proposed_qmin, omega_state.current_qmin
+                )
+                # Reset chi_Omega at segment start BEFORE folding in this step's hit.
+                reset_success = jnp.where(is_new_segment, 0.0, omega_state.current_success)
+                obs_for_policy = replace_goal_in_obs(env_state.obs, chosen_goal)
+            else:
+                key, env_state = carry
+                key, act_key = jax.random.split(key)
+                obs_for_policy = env_state.obs
+
+            action = policy(act_key, obs_for_policy, train_state)
             # Clip strictly inside the tanh range for a finite log-prob.
             action = jnp.clip(action, -1 + 1e-4, 1 - 1e-4)
             next_env_state = env.step(env_state, action)
-            # GCRL sparse reward: the env's `metrics["success"]` is computed
-            # inside its own `step` method using its own threshold and
-            # distance formula (e.g. ant_maze.py:450 uses dist<0.5;
-            # arm_push_easy.py:60 uses dist<0.1). Reading it verbatim means
-            # no threshold or distance computation lives on the algorithm side.
-            sparse_reward = next_env_state.metrics["success"]
+            raw_next_obs = next_env_state.info["raw_obs"]
+
+            if args.use_omega:
+                # Achieved goal lives in goal_indices, which is disjoint from
+                # the last goal_dim (desired-goal) slot we wrote chosen_goal into.
+                achieved = raw_next_obs[..., goal_indices]
+                reward = compute_goal_reward(raw_next_obs, chosen_goal)
+                hit = (reward > 0).astype(jnp.float32)
+                new_success = jnp.maximum(reset_success, hit)
+
+                # Apply per-step OmegaState updates in dependency order:
+                #   (a) commit chosen goal / qmin / accumulated success (used by
+                #       update_omega_cutoff for envs that just ended an episode)
+                #   (b) push achieved into B_ag (FIFO)
+                #   (c) update cutoff using just_completed_mask = b_t = done flag
+                #   (d) carry done -> prev_done for the NEXT scan step
+                omega_state = omega_state.replace(
+                    current_goals=chosen_goal,
+                    current_qmin=chosen_qmin,
+                    current_success=new_success,
+                )
+                omega_state = _insert_into_goal_buffer(omega_state, achieved)
+                done_bool = next_env_state.done.astype(jnp.bool_)
+                omega_state = update_omega_cutoff(omega_state, done_bool)
+                omega_state = omega_state.replace(prev_done=done_bool)
+
+                transition_obs = obs_for_policy
+                transition_next_obs = replace_goal_in_obs(raw_next_obs, chosen_goal)
+            else:
+                # GCRL sparse reward: the env's `metrics["success"]` is computed
+                # inside its own `step` method using its own threshold and
+                # distance formula (e.g. ant_maze.py:450 uses dist<0.5;
+                # arm_push_easy.py:60 uses dist<0.1). Reading it verbatim means
+                # no threshold or distance computation lives on the algorithm side.
+                reward = next_env_state.metrics["success"]
+                transition_obs = env_state.obs
+                transition_next_obs = raw_next_obs
+
             transition = RolloutTransition(
-                obs=env_state.obs,
+                obs=transition_obs,
                 action=action,
-                reward=sparse_reward,
-                next_obs=next_env_state.info["raw_obs"],
+                reward=reward,
+                next_obs=transition_next_obs,
                 done=next_env_state.done,
                 truncated=next_env_state.info["truncation"],
                 extras={
@@ -1662,19 +2003,33 @@ def train(args: Args):
                     "env_reward": next_env_state.reward,
                 },
             )
+            if args.use_omega:
+                return (key, next_env_state, omega_state), transition
             return (key, next_env_state), transition
 
+        if args.use_omega:
+            init = (key, train_state.last_env_state, train_state.omega_state)
+        else:
+            init = (key, train_state.last_env_state)
         rollout_state, transitions = jax.lax.scan(
             f=step_env,
-            init=(key, train_state.last_env_state),
+            init=init,
             xs=None,
             length=args.num_steps,
         )
-        _, last_env_state = rollout_state
-        train_state = train_state.replace(
-            last_env_state=last_env_state,
-            env_steps=train_state.env_steps + args.num_steps * args.num_envs,
-        )
+        if args.use_omega:
+            _, last_env_state, omega_state = rollout_state
+            train_state = train_state.replace(
+                last_env_state=last_env_state,
+                env_steps=train_state.env_steps + args.num_steps * args.num_envs,
+                omega_state=omega_state,
+            )
+        else:
+            _, last_env_state = rollout_state
+            train_state = train_state.replace(
+                last_env_state=last_env_state,
+                env_steps=train_state.env_steps + args.num_steps * args.num_envs,
+            )
         return transitions, train_state
 
     # --- Learner ----------------------------------------------------------
@@ -1859,9 +2214,21 @@ def train(args: Args):
 
     # --- train_step + training_epoch -------------------------------------
     def train_step(state: ReppoTrainingState, key):
-        """One iteration = 1 rollout (num_steps env steps) + 1 learner_fn call."""
-        key, rollout_key, learn_key = jax.random.split(key, 3)
+        """One iteration = 1 rollout (num_steps env steps) + 1 learner_fn call.
+
+        When ``args.use_omega`` is True, the OMEGA density model is refit once
+        per iteration (after the rollout has appended num_envs * num_steps
+        achieved goals to the FIFO buffer). For default
+        ``U_Omega = num_envs * num_steps`` this matches the pseudocode's
+        mid-rollout ``n_Omega >= U_Omega`` trigger.
+        """
+        key, rollout_key, refit_key, learn_key = jax.random.split(key, 4)
         transitions, state = collect_rollout(key=rollout_key, train_state=state)
+
+        if args.use_omega:
+            state = state.replace(
+                omega_state=refit_omega_density(refit_key, state.omega_state)
+            )
 
         done_mask = transitions.extras["train_done_mask"]
         train_episode_metrics = jax.tree_util.tree_map(
@@ -1887,6 +2254,15 @@ def train(args: Args):
             "rollout/reward_mean": jnp.mean(rollout_reward),
             "rollout/reward_is_binary": rollout_reward_is_binary,
         }
+        if args.use_omega:
+            metrics.update({
+                "omega/coeff": state.omega_state.omega_coeff,
+                "omega/cutoff": state.omega_state.cutoff,
+                "omega/cutoff_min": state.omega_state.cutoff_min,
+                "omega/buffer_size": state.omega_state.goal_buffer_size,
+                "omega/behavior_history_count": state.omega_state.behavior_history_count,
+                "omega/behavior_success_rate": jnp.mean(state.omega_state.behavior_history),
+            })
         if args.log_env0_transitions:
             env0_chunk = {
                 "obs": transitions.obs[:, 0],
