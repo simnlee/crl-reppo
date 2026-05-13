@@ -2509,7 +2509,7 @@ def main():
 
     # Run name summarizes the variation axes (HER ratio k and actor depth);
     # group string mirrors that plus an optional stagger tag and a timestamp.
-    run_name = f"k_{args.her_k}_d{args.actor_depth}"
+    run_name = f"k{args.her_k}_d{args.actor_depth}"
 
     group_parts = [f"k{args.her_k}", f"d{args.actor_depth}"]
     if args.stagger_envs:
