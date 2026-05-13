@@ -96,7 +96,8 @@ class Args:
     aux_loss_coeff: float = 0.0
 
     # --- HER ---
-    her_k: int = 1 # number of HER goals per original transition
+    her_k: int = 2 # number of HER goals per original transition
+    her_target_only: bool = True # if True, drop the original goal from training-target computation; only HER goals contribute to critic/actor losses. Behavior-conditioning (rollout) still uses the original goal.
 
     # --- Stagger ---
     stagger_envs: bool = True
@@ -2076,22 +2077,24 @@ def train(args: Args):
 
         obs_alt = normalizer.normalize(norm_state, obs_alt_raw)
         next_obs_alt = normalizer.normalize(norm_state, next_obs_alt_raw)
-        batch = batch.replace(
-            obs=normalizer.normalize(norm_state, batch.obs),
-            next_obs=normalizer.normalize(norm_state, batch.next_obs),
-        )
+        if not args.her_target_only:
+            batch = batch.replace(
+                obs=normalizer.normalize(norm_state, batch.obs),
+                next_obs=normalizer.normalize(norm_state, batch.next_obs),
+            )
         train_state = train_state.replace(normalization_state=new_norm_state)
 
-        # Step 3 (v6, original trajectory): soft reward, V(next), and the
-        # standard TD-lambda return G_t^{(orig)}.
-        key, orig_key = jax.random.split(key)
-        extras_orig = compute_extras(
-            key=orig_key, train_state=train_state, batch=batch
-        )
-        batch.extras.update(extras_orig)
-        batch.extras["target_values"] = jax.lax.stop_gradient(
-            nstep_lambda(batch=batch)
-        )
+        if not args.her_target_only:
+            # Step 3 (v6, original trajectory): soft reward, V(next), and the
+            # standard TD-lambda return G_t^{(orig)}.
+            key, orig_key = jax.random.split(key)
+            extras_orig = compute_extras(
+                key=orig_key, train_state=train_state, batch=batch
+            )
+            batch.extras.update(extras_orig)
+            batch.extras["target_values"] = jax.lax.stop_gradient(
+                nstep_lambda(batch=batch)
+            )
 
         # Behavior policy freeze: theta' <- theta. Used by the actor's KL
         # branch as the trust-region anchor for this iteration.
@@ -2134,19 +2137,6 @@ def train(args: Args):
         target_values_alt = jnp.moveaxis(target_values_alt_per_slot, 0, 2)
         next_emb_alt = jnp.moveaxis(next_emb_alt_per_slot, 0, 2)
 
-        # Step 4 (v6): Combine original and hindsight tuples into the
-        # unified dataset D. Each timestep t contributes 1 original tuple
-        # (valid_mask=1) and k hindsight tuples (valid_mask=1 for valid
-        # slots, 0 for slots that ran past the segment boundary).
-        batch.extras["valid_mask"] = jnp.ones(
-            batch.obs.shape[:-1], dtype=jnp.float32
-        )
-        # flatten batch from (S, E, obs_dim) to (N, obs_dim), where N=S*E is the total number of samples in the batch
-        # extras with shape (S, E, ...) are flattened to (N, ...), e.g. target_values with shape (S, E) becomes (N,)
-        orig_flat = jax.tree_util.tree_map(
-            lambda x: x.reshape((N, *x.shape[2:])), batch
-        )
-
         # The behavior action is shared across all k hindsight slots at a
         # given (t, env), so broadcast it along the k axis.
         action_alt = jnp.broadcast_to(
@@ -2169,18 +2159,34 @@ def train(args: Args):
             lambda x: x.reshape((k * N, *x.shape[3:])), alt_batch
         )
 
-        # Trim orig_flat.extras down to the 3 keys alt_flat carries so the
-        # tree structures match for concatenation along axis 0.
-        orig_stripped = orig_flat.replace(
-            extras={
-                "target_values": orig_flat.extras["target_values"],
-                "valid_mask": orig_flat.extras["valid_mask"],
-                "next_emb": orig_flat.extras["next_emb"],
-            }
-        )
-        combined_batch = jax.tree_util.tree_map(
-            lambda o, a: jnp.concatenate([o, a], axis=0), orig_stripped, alt_flat
-        )
+        if args.her_target_only:
+            # Drop the original-goal half: train only on hindsight tuples.
+            combined_batch = alt_flat
+        else:
+            # Step 4 (v6): Combine original and hindsight tuples into the
+            # unified dataset D. Each timestep t contributes 1 original tuple
+            # (valid_mask=1) and k hindsight tuples (valid_mask=1 for valid
+            # slots, 0 for slots that ran past the segment boundary).
+            batch.extras["valid_mask"] = jnp.ones(
+                batch.obs.shape[:-1], dtype=jnp.float32
+            )
+            # flatten batch from (S, E, obs_dim) to (N, obs_dim), where N=S*E is the total number of samples in the batch
+            # extras with shape (S, E, ...) are flattened to (N, ...), e.g. target_values with shape (S, E) becomes (N,)
+            orig_flat = jax.tree_util.tree_map(
+                lambda x: x.reshape((N, *x.shape[2:])), batch
+            )
+            # Trim orig_flat.extras down to the 3 keys alt_flat carries so the
+            # tree structures match for concatenation along axis 0.
+            orig_stripped = orig_flat.replace(
+                extras={
+                    "target_values": orig_flat.extras["target_values"],
+                    "valid_mask": orig_flat.extras["valid_mask"],
+                    "next_emb": orig_flat.extras["next_emb"],
+                }
+            )
+            combined_batch = jax.tree_util.tree_map(
+                lambda o, a: jnp.concatenate([o, a], axis=0), orig_stripped, alt_flat
+            )
 
         # Step 5 (v6): N_epochs of joint critic + actor SGD over D.
         # Targets are fixed for the iteration; each epoch reshuffles.
@@ -2503,7 +2509,7 @@ def main():
 
     # Run name summarizes the variation axes (HER ratio k and actor depth);
     # group string mirrors that plus an optional stagger tag and a timestamp.
-    run_name = f"k{args.her_k}_d{args.actor_depth}"
+    run_name = f"k_{args.her_k}_d{args.actor_depth}"
 
     group_parts = [f"k{args.her_k}", f"d{args.actor_depth}"]
     if args.stagger_envs:
